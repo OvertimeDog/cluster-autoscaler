@@ -18,6 +18,7 @@ package simulator
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -43,6 +44,8 @@ const (
 	// We want to disable affinity predicate for performance reasons if no pod
 	// requires it.
 	affinityPredicateName = "MatchInterPodAffinity"
+	// thresholdKey is the resource limits of the node
+	thresholdKey = "tkex.bkbcs.tencent.com//node-resource-threshold"
 )
 
 var (
@@ -356,6 +359,15 @@ func (pe *PredicateError) PredicateName() string {
 // performance gains of CheckPredicates won't always offset the cost of GetPredicateMetadata.
 // Alternatively you can pass nil as predicateMetadata.
 func (p *PredicateChecker) CheckPredicates(pod *apiv1.Pod, predicateMetadata predicates.PredicateMetadata, nodeInfo *schedulernodeinfo.NodeInfo) *PredicateError {
+	err := p.checkThreshold(pod, nodeInfo)
+	if err != nil {
+		return &PredicateError{
+			predicateName:  "ResourceThreshold",
+			failureReasons: nil,
+			err:            err,
+			debugInfo:      emptyString,
+		}
+	}
 	for _, predInfo := range p.predicates {
 		// Skip affinity predicate if it has been disabled.
 		if !p.enableAffinityPredicate && predInfo.Name == affinityPredicateName {
@@ -390,4 +402,68 @@ func (p *PredicateChecker) buildDebugInfo(predInfo PredicateInfo, nodeInfo *sche
 	default:
 		return emptyString
 	}
+}
+
+func (p *PredicateChecker) checkThreshold(pod *apiv1.Pod, nodeInfo *schedulernodeinfo.NodeInfo) error {
+	thresholdAnnotation, ok := nodeInfo.Node.Annotations[thresholdKey]
+	if !ok {
+		return nil
+	}
+	threshold := strconv.ParseFloat(thresholdAnnotation, 64)
+
+	newNodeInfo := nodeInfo.DeepCopy()
+	newNodeInfo.AddPod(pod)
+	utilInfo, err := CalculateUtilization(newNodeInfo.Node, newNodeInfo, false, false, "")
+	if err != nil {
+		klog.Warningf("Failed to calculate utilization for %s: %v", newNodeInfo.Node.Name, err)
+	}
+	if utilInfo.Utilization >= threshold {
+		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node.Name,
+			utilInfo.ResourceName, utilInfo.Utilization, threshold)
+		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node.Name,
+			utilInfo.ResourceName, utilInfo.Utilization, threshold)
+	}
+	return nil
+}
+
+func getUtilization(newNodeInfo) (utilInfo UtilizationInfo, err error) {
+	cpu, err := getUtilizationOfResource(node, nodeInfo, apiv1.ResourceCPU)
+	if err != nil {
+		return UtilizationInfo{}, err
+	}
+	mem, err := getUtilizationOfResource(node, nodeInfo, apiv1.ResourceMemory)
+	if err != nil {
+		return UtilizationInfo{}, err
+	}
+
+	utilization := UtilizationInfo{CpuUtil: cpu, MemUtil: mem}
+
+	if cpu > mem {
+		utilization.ResourceName = apiv1.ResourceCPU
+		utilization.Utilization = cpu
+	} else {
+		utilization.ResourceName = apiv1.ResourceMemory
+		utilization.Utilization = mem
+	}
+
+	return utilization, nil
+}
+
+func getUtilizationOfResource(node *apiv1.Node, nodeInfo *schedulernodeinfo.NodeInfo, resourceName apiv1.ResourceName) (float64, error) {
+	nodeAllocatable, found := node.Status.Allocatable[resourceName]
+	if !found {
+		return 0, fmt.Errorf("failed to get %v from %s", resourceName, node.Name)
+	}
+	if nodeAllocatable.MilliValue() == 0 {
+		return 0, fmt.Errorf("%v is 0 at %s", resourceName, node.Name)
+	}
+	podsRequest := resource.MustParse("0")
+	for _, pod := range nodeInfo.Pods() {
+		for _, container := range pod.Spec.Containers {
+			if resourceValue, found := container.Resources.Requests[resourceName]; found {
+				podsRequest.Add(resourceValue)
+			}
+		}
+	}
+	return float64(podsRequest.MilliValue()) / float64(nodeAllocatable.MilliValue()) * 100, nil
 }
