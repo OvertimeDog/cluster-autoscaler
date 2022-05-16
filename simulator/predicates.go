@@ -405,22 +405,23 @@ func (p *PredicateChecker) buildDebugInfo(predInfo PredicateInfo, nodeInfo *sche
 }
 
 func (p *PredicateChecker) checkThreshold(pod *apiv1.Pod, nodeInfo *schedulernodeinfo.NodeInfo) error {
-	thresholdAnnotation, ok := nodeInfo.Node.Annotations[thresholdKey]
-	if !ok {
+	thresholdAnnotation:= nodeInfo.Node().Annotations[thresholdKey]
+	if len(thresholdAnnotation) == 0 {
 		return nil
 	}
-	threshold := strconv.ParseFloat(thresholdAnnotation, 64)
+	threshold, err := strconv.ParseFloat(thresholdAnnotation, 64)
+	if err != nil 
 
 	newNodeInfo := nodeInfo.DeepCopy()
 	newNodeInfo.AddPod(pod)
-	utilInfo, err := CalculateUtilization(newNodeInfo.Node, newNodeInfo, false, false, "")
+	utilInfo, err := CalculateUtilization(newNodeInfo.Node(), newNodeInfo, false, false, "")
 	if err != nil {
-		klog.Warningf("Failed to calculate utilization for %s: %v", newNodeInfo.Node.Name, err)
+		klog.Warningf("Failed to calculate utilization for %s: %v", newNodeInfo.Node().Name, err)
 	}
 	if utilInfo.Utilization >= threshold {
-		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node.Name,
+		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node().Name,
 			utilInfo.ResourceName, utilInfo.Utilization, threshold)
-		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node.Name,
+		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node().Name,
 			utilInfo.ResourceName, utilInfo.Utilization, threshold)
 	}
 	return nil
