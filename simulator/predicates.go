@@ -405,34 +405,37 @@ func (p *PredicateChecker) buildDebugInfo(predInfo PredicateInfo, nodeInfo *sche
 }
 
 func (p *PredicateChecker) checkThreshold(pod *apiv1.Pod, nodeInfo *schedulernodeinfo.NodeInfo) error {
-	thresholdAnnotation:= nodeInfo.Node().Annotations[thresholdKey]
+	thresholdAnnotation := nodeInfo.Node().Annotations[thresholdKey]
 	if len(thresholdAnnotation) == 0 {
 		return nil
 	}
 	threshold, err := strconv.ParseFloat(thresholdAnnotation, 64)
-	if err != nil 
+	if err != nil {
+		klog.Warningf("Cannot parse %s's value (%s) to float64, err: %v", thresholdKey, thresholdAnnotation, err)
+		return nil
+	}
 
-	newNodeInfo := nodeInfo.DeepCopy()
+	newNodeInfo := nodeInfo.Clone()
 	newNodeInfo.AddPod(pod)
-	utilInfo, err := CalculateUtilization(newNodeInfo.Node(), newNodeInfo, false, false, "")
+	utilInfo, err := getUtilization(newNodeInfo)
 	if err != nil {
 		klog.Warningf("Failed to calculate utilization for %s: %v", newNodeInfo.Node().Name, err)
 	}
 	if utilInfo.Utilization >= threshold {
-		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node().Name,
-			utilInfo.ResourceName, utilInfo.Utilization, threshold)
-		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)", newNodeInfo.Node().Name,
-			utilInfo.ResourceName, utilInfo.Utilization, threshold)
+		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)",
+			newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
+		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)",
+			newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
 	}
 	return nil
 }
 
-func getUtilization(newNodeInfo) (utilInfo UtilizationInfo, err error) {
-	cpu, err := getUtilizationOfResource(node, nodeInfo, apiv1.ResourceCPU)
+func getUtilization(newNodeInfo *schedulernodeinfo.NodeInfo) (utilInfo UtilizationInfo, err error) {
+	cpu, err := getUtilizationOfResource(newNodeInfo.Node(), newNodeInfo, apiv1.ResourceCPU)
 	if err != nil {
 		return UtilizationInfo{}, err
 	}
-	mem, err := getUtilizationOfResource(node, nodeInfo, apiv1.ResourceMemory)
+	mem, err := getUtilizationOfResource(newNodeInfo.Node(), newNodeInfo, apiv1.ResourceMemory)
 	if err != nil {
 		return UtilizationInfo{}, err
 	}
@@ -450,7 +453,8 @@ func getUtilization(newNodeInfo) (utilInfo UtilizationInfo, err error) {
 	return utilization, nil
 }
 
-func getUtilizationOfResource(node *apiv1.Node, nodeInfo *schedulernodeinfo.NodeInfo, resourceName apiv1.ResourceName) (float64, error) {
+func getUtilizationOfResource(node *apiv1.Node, nodeInfo *schedulernodeinfo.NodeInfo,
+	resourceName apiv1.ResourceName) (float64, error) {
 	nodeAllocatable, found := node.Status.Allocatable[resourceName]
 	if !found {
 		return 0, fmt.Errorf("failed to get %v from %s", resourceName, node.Name)
