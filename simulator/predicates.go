@@ -421,12 +421,13 @@ func (p *PredicateChecker) checkThreshold(pod *apiv1.Pod, nodeInfo *schedulernod
 	utilInfo, err := getUtilization(newNodeInfo)
 	if err != nil {
 		klog.Warningf("Failed to calculate utilization for %s: %v", newNodeInfo.Node().Name, err)
+		return nil
 	}
 	if utilInfo.Utilization >= threshold {
-		klog.V(4).Infof("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)",
-			newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
-		return fmt.Errorf("Node %s is not suitable for removal - %s utilization (%f) bigger than threshold (%f)",
-			newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
+		klog.V(4).Infof("Node %s is not suitable for scheduling - %s utilization (%f) will bigger than threshold (%f)"+
+			"if pod %s scheduled", newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
+		return fmt.Errorf("Node %s is not suitable for scheduling - %s utilization (%f) will bigger than threshold (%f)"+
+			"if pod %s scheduled", newNodeInfo.Node().Name, utilInfo.ResourceName, utilInfo.Utilization, threshold)
 	}
 	return nil
 }
