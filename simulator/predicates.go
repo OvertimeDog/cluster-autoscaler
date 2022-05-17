@@ -46,7 +46,7 @@ const (
 	// requires it.
 	affinityPredicateName = "MatchInterPodAffinity"
 	// thresholdKey is the resource limits of the node
-	thresholdKey = "tkex.bkbcs.tencent.com//node-resource-threshold"
+	thresholdKey = "tkex.bkbcs.tencent.com/node-resource-threshold"
 )
 
 var (
