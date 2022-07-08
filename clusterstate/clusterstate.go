@@ -988,7 +988,12 @@ func (csr *ClusterStateRegistry) getCloudProviderNodeInstances() (map[string][]c
 func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProviderNodeInstances map[string][]cloudprovider.Instance, time time.Time) []UnregisteredNode {
 	registered := sets.NewString()
 	for _, node := range allNodes {
-		registered.Insert(node.Spec.ProviderID)
+		for _, address := range node.Status.Addresses {
+			if address.Type == apiv1.NodeInternalIP {
+				registered.Insert(address.Address)
+			}
+		}
+		// registered.Insert(node.Spec.ProviderID)
 	}
 	notRegistered := make([]UnregisteredNode, 0)
 	for _, instances := range cloudProviderNodeInstances {
