@@ -17,14 +17,18 @@ limitations under the License.
 package metrics
 
 import (
+	// "fmt"
 	"time"
+
+	// "k8s.io/autoscaler/cluster-autoscaler/simulator"
 
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client-go metrics registration
+	_ "k8s.io/component-base/metrics/prometheus/restclient" // for client-go metrics registration
 
-	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/klog"
+	k8smetrics "k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
+	klog "k8s.io/klog/v2"
 )
 
 // NodeScaleDownReason describes reason for removing node
@@ -55,10 +59,22 @@ const (
 	// Unready node was removed
 	Unready NodeScaleDownReason = "unready"
 
+	// CloudProviderError caused scale-up to fail
+	CloudProviderError FailedScaleUpReason = "cloudProviderError"
 	// APIError caused scale-up to fail
 	APIError FailedScaleUpReason = "apiCallError"
 	// Timeout was encountered when trying to scale-up
 	Timeout FailedScaleUpReason = "timeout"
+
+	// DirectionScaleDown is the direction of skipped scaling event when scaling in (shrinking)
+	DirectionScaleDown string = "down"
+	// DirectionScaleUp is the direction of skipped scaling event when scaling out (growing)
+	DirectionScaleUp string = "up"
+
+	// CpuResourceLimit minimum or maximum reached, check the direction label to determine min or max
+	CpuResourceLimit string = "CpuResourceLimit"
+	// MemoryResourceLimit minimum or maximum reached, check the direction label to determine min or max
+	MemoryResourceLimit string = "MemoryResourceLimit"
 
 	// autoscaledGroup is managed by CA
 	autoscaledGroup NodeGroupType = "autoscaled"
@@ -84,6 +100,7 @@ const (
 	FindUnneeded               FunctionLabel = "findUnneeded"
 	UpdateState                FunctionLabel = "updateClusterState"
 	FilterOutSchedulable       FunctionLabel = "filterOutSchedulable"
+	CloudProviderRefresh       FunctionLabel = "cloudProviderRefresh"
 	Main                       FunctionLabel = "main"
 	Poll                       FunctionLabel = "poll"
 	Reconfigure                FunctionLabel = "reconfigure"
@@ -92,49 +109,121 @@ const (
 
 var (
 	/**** Metrics related to cluster state ****/
-	clusterSafeToAutoscale = prometheus.NewGauge(
-		prometheus.GaugeOpts{
+	clusterSafeToAutoscale = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "cluster_safe_to_autoscale",
 			Help:      "Whether or not cluster is healthy enough for autoscaling. 1 if it is, 0 otherwise.",
 		},
 	)
 
-	nodesCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	nodesCount = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "nodes_count",
 			Help:      "Number of nodes in cluster.",
 		}, []string{"state"},
 	)
 
-	nodeGroupsCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	nodeGroupsCount = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "node_groups_count",
 			Help:      "Number of node groups managed by CA.",
 		}, []string{"node_group_type"},
 	)
 
-	unschedulablePodsCount = prometheus.NewGauge(
-		prometheus.GaugeOpts{
+	unschedulablePodsCount = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "unschedulable_pods_count",
 			Help:      "Number of unschedulable pods in the cluster.",
 		},
 	)
 
+	maxNodesCount = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "max_nodes_count",
+			Help:      "Maximum number of nodes in all node groups",
+		},
+	)
+
+	cpuCurrentCores = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "cluster_cpu_current_cores",
+			Help:      "Current number of cores in the cluster, minus deleting nodes.",
+		},
+	)
+
+	cpuLimitsCores = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "cpu_limits_cores",
+			Help:      "Minimum and maximum number of cores in the cluster.",
+		}, []string{"direction"},
+	)
+
+	memoryCurrentBytes = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "cluster_memory_current_bytes",
+			Help:      "Current number of bytes of memory in the cluster, minus deleting nodes.",
+		},
+	)
+
+	memoryLimitsBytes = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "memory_limits_bytes",
+			Help:      "Minimum and maximum number of bytes of memory in cluster.",
+		}, []string{"direction"},
+	)
+
+	nodesGroupMinNodes = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "node_group_min_count",
+			Help:      "Minimum number of nodes in the node group",
+		}, []string{"node_group"},
+	)
+
+	nodesGroupMaxNodes = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "node_group_max_count",
+			Help:      "Maximum number of nodes in the node group",
+		}, []string{"node_group"},
+	)
+
+	nodesGroupCurrentNodes = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "node_group_current_count",
+			Help:      "Current number of nodes in the node group",
+		}, []string{"node_group"},
+	)
+
+	nodesGroupUpcomingNodes = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "node_group_upcoming_count",
+			Help:      "Upcoming number of nodes in the node group",
+		}, []string{"node_group"},
+	)
+
 	/**** Metrics related to autoscaler execution ****/
-	lastActivity = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	lastActivity = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "last_activity",
 			Help:      "Last time certain part of CA logic executed.",
 		}, []string{"activity"},
 	)
 
-	functionDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
+	functionDuration = k8smetrics.NewHistogramVec(
+		&k8smetrics.HistogramOpts{
 			Namespace: caNamespace,
 			Name:      "function_duration_seconds",
 			Help:      "Time taken by various parts of CA main loop.",
@@ -142,8 +231,8 @@ var (
 		}, []string{"function"},
 	)
 
-	functionDurationSummary = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
+	functionDurationSummary = k8smetrics.NewSummaryVec(
+		&k8smetrics.SummaryOpts{
 			Namespace: caNamespace,
 			Name:      "function_duration_quantile_seconds",
 			Help:      "Quantiles of time taken by various parts of CA main loop.",
@@ -152,97 +241,131 @@ var (
 	)
 
 	/**** Metrics related to autoscaler operations ****/
-	errorsCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	errorsCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "errors_total",
 			Help:      "The number of CA loops failed due to an error.",
 		}, []string{"type"},
 	)
 
-	scaleUpCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	scaleUpCount = k8smetrics.NewCounter(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "scaled_up_nodes_total",
 			Help:      "Number of nodes added by CA.",
 		},
 	)
 
-	gpuScaleUpCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	gpuScaleUpCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "scaled_up_gpu_nodes_total",
 			Help:      "Number of GPU nodes added by CA, by GPU name.",
 		}, []string{"gpu_name"},
 	)
 
-	failedScaleUpCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	failedScaleUpCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "failed_scale_ups_total",
 			Help:      "Number of times scale-up operation has failed.",
 		}, []string{"reason"},
 	)
 
-	scaleDownCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	scaleDownCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "scaled_down_nodes_total",
 			Help:      "Number of nodes removed by CA.",
 		}, []string{"reason"},
 	)
 
-	gpuScaleDownCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	gpuScaleDownCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "scaled_down_gpu_nodes_total",
 			Help:      "Number of GPU nodes removed by CA, by reason and GPU name.",
 		}, []string{"reason", "gpu_name"},
 	)
 
-	evictionsCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	evictionsCount = k8smetrics.NewCounter(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "evicted_pods_total",
 			Help:      "Number of pods evicted by CA",
 		},
 	)
 
-	unneededNodesCount = prometheus.NewGauge(
-		prometheus.GaugeOpts{
+	unneededNodesCount = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "unneeded_nodes_count",
 			Help:      "Number of nodes currently considered unneeded by CA.",
 		},
 	)
 
-	scaleDownInCooldown = prometheus.NewGauge(
-		prometheus.GaugeOpts{
+	unremovableNodesCount = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "unremovable_nodes_count",
+			Help:      "Number of nodes currently considered unremovable by CA.",
+		},
+		[]string{"reason"},
+	)
+
+	scaleDownInCooldown = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "scale_down_in_cooldown",
 			Help:      "Whether or not the scale down is in cooldown. 1 if its, 0 otherwise.",
 		},
 	)
 
+	oldUnregisteredNodesRemovedCount = k8smetrics.NewCounter(
+		&k8smetrics.CounterOpts{
+			Namespace: caNamespace,
+			Name:      "old_unregistered_nodes_removed_count",
+			Help:      "Number of unregistered nodes removed by CA.",
+		},
+	)
+
+	overflowingControllersCount = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "overflowing_controllers_count",
+			Help:      "Number of controllers that own a large set of heterogenous pods, preventing CA from treating these pods as equivalent.",
+		},
+	)
+
+	skippedScaleEventsCount = k8smetrics.NewCounterVec(
+		&k8smetrics.CounterOpts{
+			Namespace: caNamespace,
+			Name:      "skipped_scale_events_count",
+			Help:      "Count of scaling events that the CA has chosen to skip.",
+		},
+		[]string{"direction", "reason"},
+	)
+
 	/**** Metrics related to NodeAutoprovisioning ****/
-	napEnabled = prometheus.NewGauge(
-		prometheus.GaugeOpts{
+	napEnabled = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
 			Name:      "nap_enabled",
 			Help:      "Whether or not Node Autoprovisioning is enabled. 1 if it is, 0 otherwise.",
 		},
 	)
 
-	nodeGroupCreationCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	nodeGroupCreationCount = k8smetrics.NewCounter(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "created_node_groups_total",
 			Help:      "Number of node groups created by Node Autoprovisioning.",
 		},
 	)
 
-	nodeGroupDeletionCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	nodeGroupDeletionCount = k8smetrics.NewCounter(
+		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "deleted_node_groups_total",
 			Help:      "Number of node groups deleted by Node Autoprovisioning.",
@@ -251,26 +374,42 @@ var (
 )
 
 // RegisterAll registers all metrics.
-func RegisterAll() {
-	prometheus.MustRegister(clusterSafeToAutoscale)
-	prometheus.MustRegister(nodesCount)
-	prometheus.MustRegister(nodeGroupsCount)
-	prometheus.MustRegister(unschedulablePodsCount)
-	prometheus.MustRegister(lastActivity)
-	prometheus.MustRegister(functionDuration)
-	prometheus.MustRegister(functionDurationSummary)
-	prometheus.MustRegister(errorsCount)
-	prometheus.MustRegister(scaleUpCount)
-	prometheus.MustRegister(gpuScaleUpCount)
-	prometheus.MustRegister(failedScaleUpCount)
-	prometheus.MustRegister(scaleDownCount)
-	prometheus.MustRegister(gpuScaleDownCount)
-	prometheus.MustRegister(evictionsCount)
-	prometheus.MustRegister(unneededNodesCount)
-	prometheus.MustRegister(scaleDownInCooldown)
-	prometheus.MustRegister(napEnabled)
-	prometheus.MustRegister(nodeGroupCreationCount)
-	prometheus.MustRegister(nodeGroupDeletionCount)
+func RegisterAll(emitPerNodeGroupMetrics bool) {
+	legacyregistry.MustRegister(clusterSafeToAutoscale)
+	legacyregistry.MustRegister(nodesCount)
+	legacyregistry.MustRegister(nodeGroupsCount)
+	legacyregistry.MustRegister(unschedulablePodsCount)
+	legacyregistry.MustRegister(maxNodesCount)
+	legacyregistry.MustRegister(cpuCurrentCores)
+	legacyregistry.MustRegister(cpuLimitsCores)
+	legacyregistry.MustRegister(memoryCurrentBytes)
+	legacyregistry.MustRegister(memoryLimitsBytes)
+	legacyregistry.MustRegister(lastActivity)
+	legacyregistry.MustRegister(functionDuration)
+	legacyregistry.MustRegister(functionDurationSummary)
+	legacyregistry.MustRegister(errorsCount)
+	legacyregistry.MustRegister(scaleUpCount)
+	legacyregistry.MustRegister(gpuScaleUpCount)
+	legacyregistry.MustRegister(failedScaleUpCount)
+	legacyregistry.MustRegister(scaleDownCount)
+	legacyregistry.MustRegister(gpuScaleDownCount)
+	legacyregistry.MustRegister(evictionsCount)
+	legacyregistry.MustRegister(unneededNodesCount)
+	legacyregistry.MustRegister(unremovableNodesCount)
+	legacyregistry.MustRegister(scaleDownInCooldown)
+	legacyregistry.MustRegister(oldUnregisteredNodesRemovedCount)
+	legacyregistry.MustRegister(overflowingControllersCount)
+	legacyregistry.MustRegister(skippedScaleEventsCount)
+	legacyregistry.MustRegister(napEnabled)
+	legacyregistry.MustRegister(nodeGroupCreationCount)
+	legacyregistry.MustRegister(nodeGroupDeletionCount)
+
+	if emitPerNodeGroupMetrics {
+		legacyregistry.MustRegister(nodesGroupMinNodes)
+		legacyregistry.MustRegister(nodesGroupMaxNodes)
+		legacyregistry.MustRegister(nodesGroupCurrentNodes)
+		legacyregistry.MustRegister(nodesGroupUpcomingNodes)
+	}
 }
 
 // UpdateDurationFromStart records the duration of the step identified by the
@@ -325,6 +464,53 @@ func UpdateUnschedulablePodsCount(podsCount int) {
 	unschedulablePodsCount.Set(float64(podsCount))
 }
 
+// UpdateMaxNodesCount records the current maximum number of nodes being set for all node groups
+func UpdateMaxNodesCount(nodesCount int) {
+	maxNodesCount.Set(float64(nodesCount))
+}
+
+// UpdateClusterCPUCurrentCores records the number of cores in the cluster, minus deleting nodes
+func UpdateClusterCPUCurrentCores(coresCount int64) {
+	cpuCurrentCores.Set(float64(coresCount))
+}
+
+// UpdateCPULimitsCores records the minimum and maximum number of cores in the cluster
+func UpdateCPULimitsCores(minCoresCount int64, maxCoresCount int64) {
+	cpuLimitsCores.WithLabelValues("minimum").Set(float64(minCoresCount))
+	cpuLimitsCores.WithLabelValues("maximum").Set(float64(maxCoresCount))
+}
+
+// UpdateClusterMemoryCurrentBytes records the number of bytes of memory in the cluster, minus deleting nodes
+func UpdateClusterMemoryCurrentBytes(memoryCount int64) {
+	memoryCurrentBytes.Set(float64(memoryCount))
+}
+
+// UpdateMemoryLimitsBytes records the minimum and maximum bytes of memory in the cluster
+func UpdateMemoryLimitsBytes(minMemoryCount int64, maxMemoryCount int64) {
+	memoryLimitsBytes.WithLabelValues("minimum").Set(float64(minMemoryCount))
+	memoryLimitsBytes.WithLabelValues("maximum").Set(float64(maxMemoryCount))
+}
+
+// UpdateNodeGroupMin records the node group minimum allowed number of nodes
+func UpdateNodeGroupMin(nodeGroup string, minNodes int) {
+	nodesGroupMinNodes.WithLabelValues(nodeGroup).Set(float64(minNodes))
+}
+
+// UpdateNodeGroupMax records the node group maximum allowed number of nodes
+func UpdateNodeGroupMax(nodeGroup string, maxNodes int) {
+	nodesGroupMaxNodes.WithLabelValues(nodeGroup).Set(float64(maxNodes))
+}
+
+// UpdateNodeGroupCurrent records the node group desired number
+func UpdateNodeGroupCurrent(nodeGroup string, curNodes int) {
+	nodesGroupCurrentNodes.WithLabelValues(nodeGroup).Set(float64(curNodes))
+}
+
+// UpdateNodeGroupUpcoming records the node group upcoming number
+func UpdateNodeGroupUpcoming(nodeGroup string, upcoming int) {
+	nodesGroupUpcomingNodes.WithLabelValues(nodeGroup).Set(float64(upcoming))
+}
+
 // RegisterError records any errors preventing Cluster Autoscaler from working.
 // No more than one error should be recorded per loop.
 func RegisterError(err errors.AutoscalerError) {
@@ -362,6 +548,13 @@ func UpdateUnneededNodesCount(nodesCount int) {
 	unneededNodesCount.Set(float64(nodesCount))
 }
 
+// UpdateUnremovableNodesCount records number of currently unremovable nodes
+// func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
+// 	for reason, count := range unremovableReasonCounts {
+// 		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
+// 	}
+// }
+
 // UpdateNapEnabled records if NodeAutoprovisioning is enabled
 func UpdateNapEnabled(enabled bool) {
 	if enabled {
@@ -389,4 +582,36 @@ func UpdateScaleDownInCooldown(inCooldown bool) {
 	} else {
 		scaleDownInCooldown.Set(0.0)
 	}
+}
+
+// RegisterOldUnregisteredNodesRemoved records number of old unregistered
+// nodes that have been removed by the cluster autoscaler
+func RegisterOldUnregisteredNodesRemoved(nodesCount int) {
+	oldUnregisteredNodesRemovedCount.Add(float64(nodesCount))
+}
+
+// UpdateOverflowingControllers sets the number of controllers that could not
+// have their pods cached.
+func UpdateOverflowingControllers(count int) {
+	overflowingControllersCount.Set(float64(count))
+}
+
+// RegisterSkippedScaleDownCPU increases the count of skipped scale outs because of CPU resource limits
+func RegisterSkippedScaleDownCPU() {
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleDown, CpuResourceLimit).Add(1.0)
+}
+
+// RegisterSkippedScaleDownMemory increases the count of skipped scale outs because of Memory resource limits
+func RegisterSkippedScaleDownMemory() {
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleDown, MemoryResourceLimit).Add(1.0)
+}
+
+// RegisterSkippedScaleUpCPU increases the count of skipped scale outs because of CPU resource limits
+func RegisterSkippedScaleUpCPU() {
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleUp, CpuResourceLimit).Add(1.0)
+}
+
+// RegisterSkippedScaleUpMemory increases the count of skipped scale outs because of Memory resource limits
+func RegisterSkippedScaleUpMemory() {
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleUp, MemoryResourceLimit).Add(1.0)
 }
