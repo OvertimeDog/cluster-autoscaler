@@ -305,13 +305,22 @@ var (
 		},
 	)
 
-	unremovableNodesCount = k8smetrics.NewGaugeVec(
+	// unremovableNodesCount = k8smetrics.NewGaugeVec(
+	// 	&k8smetrics.GaugeOpts{
+	// 		Namespace: caNamespace,
+	// 		Name:      "unremovable_nodes_count",
+	// 		Help:      "Number of nodes currently considered unremovable by CA.",
+	// 	},
+	// 	[]string{"reason"},
+	// )
+
+	unremovableNodes = k8smetrics.NewGaugeVec(
 		&k8smetrics.GaugeOpts{
 			Namespace: caNamespace,
-			Name:      "unremovable_nodes_count",
-			Help:      "Number of nodes currently considered unremovable by CA.",
+			Name:      "unremovable_nodes",
+			Help:      "Nodes currently considered unremovable by CA.",
 		},
-		[]string{"reason"},
+		[]string{"nodeName", "reason", "blockingPod"},
 	)
 
 	scaleDownInCooldown = k8smetrics.NewGauge(
@@ -395,7 +404,8 @@ func RegisterAll(emitPerNodeGroupMetrics bool) {
 	legacyregistry.MustRegister(gpuScaleDownCount)
 	legacyregistry.MustRegister(evictionsCount)
 	legacyregistry.MustRegister(unneededNodesCount)
-	legacyregistry.MustRegister(unremovableNodesCount)
+	// legacyregistry.MustRegister(unremovableNodesCount)
+	legacyregistry.MustRegister(unremovableNodes)
 	legacyregistry.MustRegister(scaleDownInCooldown)
 	legacyregistry.MustRegister(oldUnregisteredNodesRemovedCount)
 	legacyregistry.MustRegister(overflowingControllersCount)
@@ -548,11 +558,15 @@ func UpdateUnneededNodesCount(nodesCount int) {
 	unneededNodesCount.Set(float64(nodesCount))
 }
 
-// UpdateUnremovableNodesCount records number of currently unremovable nodes
-func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
-	for reason, count := range unremovableReasonCounts {
-		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
-	}
+// // UpdateUnremovableNodesCount records number of currently unremovable nodes
+// func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
+// 	for reason, count := range unremovableReasonCounts {
+// 		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
+// 	}
+// }
+
+func UpdateUnremovableNodes(nodeName, reason, blocking string) {
+	unremovable_nodes.WithLabelValues(nodeName, reason, blocking).Set(1)
 }
 
 // UpdateNapEnabled records if NodeAutoprovisioning is enabled
