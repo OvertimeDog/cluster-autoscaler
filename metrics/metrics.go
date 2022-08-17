@@ -549,11 +549,11 @@ func UpdateUnneededNodesCount(nodesCount int) {
 }
 
 // UpdateUnremovableNodesCount records number of currently unremovable nodes
-// func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
-// 	for reason, count := range unremovableReasonCounts {
-// 		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
-// 	}
-// }
+func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
+	for reason, count := range unremovableReasonCounts {
+		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
+	}
+}
 
 // UpdateNapEnabled records if NodeAutoprovisioning is enabled
 func UpdateNapEnabled(enabled bool) {
