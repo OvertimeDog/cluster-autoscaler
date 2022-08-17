@@ -320,7 +320,7 @@ var (
 			Name:      "unremovable_nodes",
 			Help:      "Nodes currently considered unremovable by CA.",
 		},
-		[]string{"nodeName", "reason", "blockingPod"},
+		[]string{"nodeName", "reason", "blockingPod", "blockingReason"},
 	)
 
 	scaleDownInCooldown = k8smetrics.NewGauge(
@@ -565,8 +565,8 @@ func UpdateUnneededNodesCount(nodesCount int) {
 // 	}
 // }
 
-func UpdateUnremovableNodes(nodeName, reason, blocking string) {
-	unremovable_nodes.WithLabelValues(nodeName, reason, blocking).Set(1)
+func UpdateUnremovableNodes(nodeName, reason, blockingPod, blockingReason string) {
+	unremovableNodes.WithLabelValues(nodeName, reason, blockingPod, blockingReason).Set(1)
 }
 
 // UpdateNapEnabled records if NodeAutoprovisioning is enabled
