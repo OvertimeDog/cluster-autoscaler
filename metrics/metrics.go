@@ -565,8 +565,13 @@ func UpdateUnneededNodesCount(nodesCount int) {
 // 	}
 // }
 
+// UnremovableNodes records the reason why the node cannot be removed
 func UpdateUnremovableNodes(nodeName, reason, blockingPod, blockingReason string) {
 	unremovableNodes.WithLabelValues(nodeName, reason, blockingPod, blockingReason).Set(1)
+}
+
+func ResetUnremovableNodes() {
+	unremovableNodes.Reset()
 }
 
 // UpdateNapEnabled records if NodeAutoprovisioning is enabled
