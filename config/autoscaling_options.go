@@ -72,6 +72,10 @@ type AutoscalingOptions struct {
 	MaxGracefulTerminationSec int
 	//  Maximum time CA waits for node to be provisioned
 	MaxNodeProvisionTime time.Duration
+	// MaxNodeStartupTime is the maximum time from the moment the node is registered to the time the node is ready.
+	MaxNodeStartupTime time.Duration
+	// MaxNodeStartScheduleTime is the maximum time from the moment the node is ready to the time the node is schedulable.
+	MaxNodeStartScheduleTime time.Duration
 	// MaxTotalUnreadyPercentage is the maximum percentage of unready nodes after which CA halts operations
 	MaxTotalUnreadyPercentage float64
 	// OkTotalUnreadyCount is the number of allowed unready nodes, irrespective of max-total-unready-percentage
