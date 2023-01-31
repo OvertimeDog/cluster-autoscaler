@@ -40,8 +40,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
-	"k8s.io/klog"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	klog "k8s.io/klog/v2"
 	provider_aws "k8s.io/legacy-cloud-providers/aws"
 )
 
@@ -49,8 +48,10 @@ const (
 	operationWaitTimeout    = 5 * time.Second
 	operationPollInterval   = 100 * time.Millisecond
 	maxRecordsReturnedByAPI = 100
-	maxAsgNamesPerDescribe  = 50
+	maxAsgNamesPerDescribe  = 100
 	refreshInterval         = 1 * time.Minute
+	autoDiscovererTypeASG   = "asg"
+	asgAutoDiscovererKeyTag = "tag"
 )
 
 // AwsManager is handles aws communication and data caching.
@@ -59,6 +60,7 @@ type AwsManager struct {
 	ec2Service         ec2Wrapper
 	asgCache           *asgCache
 	lastRefresh        time.Time
+	instanceTypes      map[string]*InstanceType
 }
 
 type asgTemplate struct {
@@ -172,6 +174,7 @@ func createAWSManagerInternal(
 	discoveryOpts cloudprovider.NodeGroupDiscoveryOptions,
 	autoScalingService *autoScalingWrapper,
 	ec2Service *ec2Wrapper,
+	instanceTypes map[string]*InstanceType,
 ) (*AwsManager, error) {
 
 	cfg, err := readAWSCloudConfig(configReader)
@@ -194,7 +197,8 @@ func createAWSManagerInternal(
 		}
 
 		if autoScalingService == nil {
-			autoScalingService = &autoScalingWrapper{autoscaling.New(sess), map[string]string{}}
+			c := newLaunchConfigurationInstanceTypeCache()
+			autoScalingService = &autoScalingWrapper{autoscaling.New(sess), c}
 		}
 
 		if ec2Service == nil {
@@ -202,7 +206,7 @@ func createAWSManagerInternal(
 		}
 	}
 
-	specs, err := discoveryOpts.ParseASGAutoDiscoverySpecs()
+	specs, err := parseASGAutoDiscoverySpecs(discoveryOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +220,7 @@ func createAWSManagerInternal(
 		autoScalingService: *autoScalingService,
 		ec2Service:         *ec2Service,
 		asgCache:           cache,
+		instanceTypes:      instanceTypes,
 	}
 
 	if err := manager.forceRefresh(); err != nil {
@@ -241,8 +246,8 @@ func readAWSCloudConfig(config io.Reader) (*provider_aws.CloudConfig, error) {
 }
 
 // CreateAwsManager constructs awsManager object.
-func CreateAwsManager(configReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*AwsManager, error) {
-	return createAWSManagerInternal(configReader, discoveryOpts, nil, nil)
+func CreateAwsManager(configReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, instanceTypes map[string]*InstanceType) (*AwsManager, error) {
+	return createAWSManagerInternal(configReader, discoveryOpts, nil, nil, instanceTypes)
 }
 
 // Refresh is called before every main loop and can be used to dynamically update cloud provider state.
@@ -288,8 +293,9 @@ func (m *AwsManager) DeleteInstances(instances []*AwsInstanceRef) error {
 	if err := m.asgCache.DeleteInstances(instances); err != nil {
 		return err
 	}
-	klog.V(2).Infof("Some ASG instances might have been deleted, forcing ASG list refresh")
-	return m.forceRefresh()
+	klog.V(2).Infof("DeleteInstances was called: scheduling an ASG list refresh for next main loop evaluation")
+	m.lastRefresh = time.Now().Add(-refreshInterval)
+	return nil
 }
 
 // GetAsgNodes returns Asg nodes.
@@ -306,7 +312,7 @@ func (m *AwsManager) getAsgTemplate(asg *asg) (*asgTemplate, error) {
 	region := az[0 : len(az)-1]
 
 	if len(asg.AvailabilityZones) > 1 {
-		klog.Warningf("Found multiple availability zones for ASG %q; using %s\n", asg.Name, az)
+		klog.V(4).Infof("Found multiple availability zones for ASG %q; using %s for %s label\n", asg.Name, az, apiv1.LabelFailureDomainBetaZone)
 	}
 
 	instanceTypeName, err := m.buildInstanceType(asg)
@@ -314,7 +320,7 @@ func (m *AwsManager) getAsgTemplate(asg *asg) (*asgTemplate, error) {
 		return nil, err
 	}
 
-	if t, ok := InstanceTypes[instanceTypeName]; ok {
+	if t, ok := m.instanceTypes[instanceTypeName]; ok {
 		return &asgTemplate{
 			InstanceType: t,
 			Region:       region,
@@ -370,10 +376,10 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 	// TODO: use proper allocatable!!
 	node.Status.Allocatable = node.Status.Capacity
 
-	// NodeLabels
-	node.Labels = cloudprovider.JoinStringMaps(node.Labels, extractLabelsFromAsg(template.Tags))
 	// GenericLabels
 	node.Labels = cloudprovider.JoinStringMaps(node.Labels, buildGenericLabels(template, nodeName))
+	// NodeLabels
+	node.Labels = cloudprovider.JoinStringMaps(node.Labels, extractLabelsFromAsg(template.Tags))
 
 	node.Spec.Taints = extractTaintsFromAsg(template.Tags)
 
@@ -383,14 +389,14 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 
 func buildGenericLabels(template *asgTemplate, nodeName string) map[string]string {
 	result := make(map[string]string)
-	// TODO: extract it somehow
-	result[kubeletapis.LabelArch] = cloudprovider.DefaultArch
-	result[kubeletapis.LabelOS] = cloudprovider.DefaultOS
 
-	result[apiv1.LabelInstanceType] = template.InstanceType.InstanceType
+	result[apiv1.LabelArchStable] = template.InstanceType.Architecture
+	result[apiv1.LabelOSStable] = cloudprovider.DefaultOS
 
-	result[apiv1.LabelZoneRegion] = template.Region
-	result[apiv1.LabelZoneFailureDomain] = template.Zone
+	result[apiv1.LabelInstanceTypeStable] = template.InstanceType.InstanceType
+
+	result[apiv1.LabelTopologyRegion] = template.Region
+	result[apiv1.LabelTopologyZone] = template.Zone
 	result[apiv1.LabelHostname] = nodeName
 	return result
 }
@@ -458,4 +464,64 @@ func extractTaintsFromAsg(tags []*autoscaling.TagDescription) []apiv1.Taint {
 		}
 	}
 	return taints
+}
+
+// An asgAutoDiscoveryConfig specifies how to autodiscover AWS ASGs.
+type asgAutoDiscoveryConfig struct {
+	// Tags to match on.
+	// Any ASG with all of the provided tag keys will be autoscaled.
+	Tags map[string]string
+}
+
+// ParseASGAutoDiscoverySpecs returns any provided NodeGroupAutoDiscoverySpecs
+// parsed into configuration appropriate for ASG autodiscovery.
+func parseASGAutoDiscoverySpecs(o cloudprovider.NodeGroupDiscoveryOptions) ([]asgAutoDiscoveryConfig, error) {
+	cfgs := make([]asgAutoDiscoveryConfig, len(o.NodeGroupAutoDiscoverySpecs))
+	var err error
+	for i, spec := range o.NodeGroupAutoDiscoverySpecs {
+		cfgs[i], err = parseASGAutoDiscoverySpec(spec)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return cfgs, nil
+}
+
+func parseASGAutoDiscoverySpec(spec string) (asgAutoDiscoveryConfig, error) {
+	cfg := asgAutoDiscoveryConfig{}
+
+	tokens := strings.Split(spec, ":")
+	if len(tokens) != 2 {
+		return cfg, fmt.Errorf("invalid node group auto discovery spec specified via --node-group-auto-discovery: %s", spec)
+	}
+	discoverer := tokens[0]
+	if discoverer != autoDiscovererTypeASG {
+		return cfg, fmt.Errorf("unsupported discoverer specified: %s", discoverer)
+	}
+	param := tokens[1]
+	kv := strings.SplitN(param, "=", 2)
+	if len(kv) != 2 {
+		return cfg, fmt.Errorf("invalid key=value pair %s", kv)
+	}
+	k, v := kv[0], kv[1]
+	if k != asgAutoDiscovererKeyTag {
+		return cfg, fmt.Errorf("unsupported parameter key \"%s\" is specified for discoverer \"%s\". The only supported key is \"%s\"", k, discoverer, asgAutoDiscovererKeyTag)
+	}
+	if v == "" {
+		return cfg, errors.New("tag value not supplied")
+	}
+	p := strings.Split(v, ",")
+	if len(p) == 0 {
+		return cfg, fmt.Errorf("invalid ASG tag for auto discovery specified: ASG tag must not be empty")
+	}
+	cfg.Tags = make(map[string]string, len(p))
+	for _, label := range p {
+		lp := strings.SplitN(label, "=", 2)
+		if len(lp) > 1 {
+			cfg.Tags[lp[0]] = lp[1]
+			continue
+		}
+		cfg.Tags[lp[0]] = ""
+	}
+	return cfg, nil
 }

@@ -27,7 +27,7 @@ import (
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	kube_client "k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
 
 // AutoscalingContext contains user-configurable constant and configuration-related objects passed to
@@ -41,7 +41,9 @@ type AutoscalingContext struct {
 	CloudProvider cloudprovider.CloudProvider
 	// TODO(kgolab) - move away too as it's not config
 	// PredicateChecker to check if a pod can fit into a node.
-	PredicateChecker *simulator.PredicateChecker
+	PredicateChecker simulator.PredicateChecker
+	// ClusterSnapshot denotes cluster snapshot used for predicate checking.
+	ClusterSnapshot simulator.ClusterSnapshot
 	// ExpanderStrategy is the strategy used to choose which node group to expand when scaling up
 	ExpanderStrategy expander.Strategy
 	// EstimatorBuilder is the builder function for node count estimator to be used.
@@ -83,15 +85,21 @@ func NewResourceLimiterFromAutoscalingOptions(options config.AutoscalingOptions)
 }
 
 // NewAutoscalingContext returns an autoscaling context from all the necessary parameters passed via arguments
-func NewAutoscalingContext(options config.AutoscalingOptions, predicateChecker *simulator.PredicateChecker,
-	autoscalingKubeClients *AutoscalingKubeClients, cloudProvider cloudprovider.CloudProvider,
-	expanderStrategy expander.Strategy, estimatorBuilder estimator.EstimatorBuilder,
+func NewAutoscalingContext(
+	options config.AutoscalingOptions,
+	predicateChecker simulator.PredicateChecker,
+	clusterSnapshot simulator.ClusterSnapshot,
+	autoscalingKubeClients *AutoscalingKubeClients,
+	cloudProvider cloudprovider.CloudProvider,
+	expanderStrategy expander.Strategy,
+	estimatorBuilder estimator.EstimatorBuilder,
 	processorCallbacks processor_callbacks.ProcessorCallbacks) *AutoscalingContext {
 	return &AutoscalingContext{
 		AutoscalingOptions:     options,
 		CloudProvider:          cloudProvider,
 		AutoscalingKubeClients: *autoscalingKubeClients,
 		PredicateChecker:       predicateChecker,
+		ClusterSnapshot:        clusterSnapshot,
 		ExpanderStrategy:       expanderStrategy,
 		EstimatorBuilder:       estimatorBuilder,
 		ProcessorCallbacks:     processorCallbacks,
@@ -103,12 +111,12 @@ func NewAutoscalingKubeClients(opts config.AutoscalingOptions, kubeClient, event
 	listerRegistryStopChannel := make(chan struct{})
 	listerRegistry := kube_util.NewListerRegistryWithDefaultListers(kubeClient, listerRegistryStopChannel)
 	kubeEventRecorder := kube_util.CreateEventRecorder(eventsKubeClient)
-	logRecorder, err := utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, opts.WriteStatusConfigMap)
+	logRecorder, err := utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, opts.WriteStatusConfigMap, opts.StatusConfigMapName)
 	if err != nil {
 		klog.Error("Failed to initialize status configmap, unable to write status events")
 		// Get a dummy, so we can at least safely call the methods
 		// TODO(maciekpytel): recover from this after successful status configmap update?
-		logRecorder, _ = utils.NewStatusMapRecorder(eventsKubeClient, opts.ConfigNamespace, kubeEventRecorder, false)
+		logRecorder, _ = utils.NewStatusMapRecorder(eventsKubeClient, opts.ConfigNamespace, kubeEventRecorder, false, opts.StatusConfigMapName)
 	}
 
 	return &AutoscalingKubeClients{

@@ -19,16 +19,14 @@ package aws
 import (
 	"fmt"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
 
 const (
@@ -44,7 +42,7 @@ type asgCache struct {
 	service        autoScalingWrapper
 	interrupt      chan struct{}
 
-	asgAutoDiscoverySpecs []cloudprovider.ASGAutoDiscoveryConfig
+	asgAutoDiscoverySpecs []asgAutoDiscoveryConfig
 	explicitlyConfigured  map[AwsRef]bool
 }
 
@@ -72,7 +70,7 @@ type asg struct {
 	Tags                    []*autoscaling.TagDescription
 }
 
-func newASGCache(service autoScalingWrapper, explicitSpecs []string, autoDiscoverySpecs []cloudprovider.ASGAutoDiscoveryConfig) (*asgCache, error) {
+func newASGCache(service autoScalingWrapper, explicitSpecs []string, autoDiscoverySpecs []asgAutoDiscoveryConfig) (*asgCache, error) {
 	registry := &asgCache{
 		registeredAsgs:        make([]*asg, 0),
 		service:               service,
@@ -277,18 +275,17 @@ func (m *asgCache) DeleteInstances(instances []*AwsInstanceRef) error {
 				return err
 			}
 			klog.V(4).Infof(*resp.Activity.Description)
-		}
 
-		// Proactively decrement the size so autoscaler makes better decisions
-		commonAsg.curSize--
+			// Proactively decrement the size so autoscaler makes better decisions
+			commonAsg.curSize--
+		}
 	}
 	return nil
 }
 
 // isPlaceholderInstance checks if the given instance is only a placeholder
 func (m *asgCache) isPlaceholderInstance(instance *AwsInstanceRef) bool {
-	matched, _ := regexp.MatchString(fmt.Sprintf("^%s.*\\d+$", placeholderInstanceNamePrefix), instance.Name)
-	return matched
+	return strings.HasPrefix(instance.Name, placeholderInstanceNamePrefix)
 }
 
 // Fetch automatically discovered ASGs. These ASGs should be unregistered if
@@ -357,6 +354,11 @@ func (m *asgCache) regenerate() error {
 		return err
 	}
 
+	err = m.service.populateLaunchConfigurationInstanceTypeCache(groups)
+	if err != nil {
+		klog.Warningf("Failed to fully populate all launchConfigurations: %v", err)
+	}
+
 	// If currently any ASG has more Desired than running Instances, introduce placeholders
 	// for the instances to come up. This is required to track Desired instances that
 	// will never come up, like with Spot Request that can't be fulfilled
@@ -397,15 +399,15 @@ func (m *asgCache) regenerate() error {
 func (m *asgCache) createPlaceholdersForDesiredNonStartedInstances(groups []*autoscaling.Group) []*autoscaling.Group {
 	for _, g := range groups {
 		desired := *g.DesiredCapacity
-		real := int64(len(g.Instances))
-		if desired <= real {
+		realInstances := int64(len(g.Instances))
+		if desired <= realInstances {
 			continue
 		}
 
-		for i := real; i < desired; i++ {
+		klog.V(4).Infof("Instance group %s has only %d instances created while requested count is %d. "+
+			"Creating placeholder instances.", *g.AutoScalingGroupName, realInstances, desired)
+		for i := realInstances; i < desired; i++ {
 			id := fmt.Sprintf("%s-%s-%d", placeholderInstanceNamePrefix, *g.AutoScalingGroupName, i)
-			klog.V(4).Infof("Instance group %s has only %d instances created while requested count is %d. "+
-				"Creating placeholder instance with ID %s.", *g.AutoScalingGroupName, real, desired, id)
 			g.Instances = append(g.Instances, &autoscaling.Instance{
 				InstanceId:       &id,
 				AvailabilityZone: g.AvailabilityZones[0],

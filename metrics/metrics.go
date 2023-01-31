@@ -17,10 +17,10 @@ limitations under the License.
 package metrics
 
 import (
-	// "fmt"
+	"fmt"
 	"time"
 
-	// "k8s.io/autoscaler/cluster-autoscaler/simulator"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
@@ -305,14 +305,14 @@ var (
 		},
 	)
 
-	// unremovableNodesCount = k8smetrics.NewGaugeVec(
-	// 	&k8smetrics.GaugeOpts{
-	// 		Namespace: caNamespace,
-	// 		Name:      "unremovable_nodes_count",
-	// 		Help:      "Number of nodes currently considered unremovable by CA.",
-	// 	},
-	// 	[]string{"reason"},
-	// )
+	unremovableNodesCount = k8smetrics.NewGaugeVec(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "unremovable_nodes_count",
+			Help:      "Number of nodes currently considered unremovable by CA.",
+		},
+		[]string{"reason"},
+	)
 
 	unremovableNodes = k8smetrics.NewGaugeVec(
 		&k8smetrics.GaugeOpts{
@@ -404,7 +404,7 @@ func RegisterAll(emitPerNodeGroupMetrics bool) {
 	legacyregistry.MustRegister(gpuScaleDownCount)
 	legacyregistry.MustRegister(evictionsCount)
 	legacyregistry.MustRegister(unneededNodesCount)
-	// legacyregistry.MustRegister(unremovableNodesCount)
+	legacyregistry.MustRegister(unremovableNodesCount)
 	legacyregistry.MustRegister(unremovableNodes)
 	legacyregistry.MustRegister(scaleDownInCooldown)
 	legacyregistry.MustRegister(oldUnregisteredNodesRemovedCount)
@@ -558,12 +558,12 @@ func UpdateUnneededNodesCount(nodesCount int) {
 	unneededNodesCount.Set(float64(nodesCount))
 }
 
-// // UpdateUnremovableNodesCount records number of currently unremovable nodes
-// func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
-// 	for reason, count := range unremovableReasonCounts {
-// 		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
-// 	}
-// }
+// UpdateUnremovableNodesCount records number of currently unremovable nodes
+func UpdateUnremovableNodesCount(unremovableReasonCounts map[simulator.UnremovableReason]int) {
+	for reason, count := range unremovableReasonCounts {
+		unremovableNodesCount.WithLabelValues(fmt.Sprintf("%v", reason)).Set(float64(count))
+	}
+}
 
 // UnremovableNodes records the reason why the node cannot be removed
 func UpdateUnremovableNodes(nodeName, reason, blockingPod, blockingReason string) {

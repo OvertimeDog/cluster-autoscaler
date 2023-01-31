@@ -17,15 +17,17 @@ limitations under the License.
 package digitalocean
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 var _ cloudprovider.CloudProvider = (*digitaloceanCloudProvider)(nil)
@@ -33,6 +35,8 @@ var _ cloudprovider.CloudProvider = (*digitaloceanCloudProvider)(nil)
 const (
 	// GPULabel is the label added to nodes with GPU resource.
 	GPULabel = "cloud.digitalocean.com/gpu-node"
+
+	doProviderIDPrefix = "digitalocean://"
 )
 
 // digitaloceanCloudProvider implements CloudProvider interface.
@@ -41,15 +45,11 @@ type digitaloceanCloudProvider struct {
 	resourceLimiter *cloudprovider.ResourceLimiter
 }
 
-func newDigitalOceanCloudProvider(manager *Manager, rl *cloudprovider.ResourceLimiter) (*digitaloceanCloudProvider, error) {
-	if err := manager.Refresh(); err != nil {
-		return nil, err
-	}
-
+func newDigitalOceanCloudProvider(manager *Manager, rl *cloudprovider.ResourceLimiter) *digitaloceanCloudProvider {
 	return &digitaloceanCloudProvider{
 		manager:         manager,
 		resourceLimiter: rl,
-	}, nil
+	}
 }
 
 // Name returns name of the cloud provider.
@@ -70,13 +70,8 @@ func (d *digitaloceanCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 // should not be processed by cluster autoscaler, or non-nil error if such
 // occurred. Must be implemented.
 func (d *digitaloceanCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
-	nodeID, ok := node.Labels[nodeIDLabel]
-	if !ok {
-		// CA creates fake node objects to represent upcoming VMs that haven't
-		// registered as nodes yet. They have node.Spec.ProviderID set. Use
-		// that as nodeID.
-		nodeID = node.Spec.ProviderID
-	}
+	providerID := node.Spec.ProviderID
+	nodeID := toNodeID(providerID)
 
 	klog.V(5).Infof("checking nodegroup for node ID: %q", nodeID)
 
@@ -91,8 +86,10 @@ func (d *digitaloceanCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudpro
 		}
 
 		for _, node := range nodes {
-			klog.V(6).Infof("checking node have: %q want: %q", node.Id, nodeID)
-			if node.Id != nodeID {
+			klog.V(6).Infof("checking node has: %q want: %q", node.Id, providerID)
+			// CA uses node.Spec.ProviderID when looking for (un)registered nodes,
+			// so we need to use it here too.
+			if node.Id != providerID {
 				continue
 			}
 
@@ -184,10 +181,15 @@ func BuildDigitalOcean(
 	// the cloud provider automatically uses all node pools in DigitalOcean.
 	// This means we don't use the cloudprovider.NodeGroupDiscoveryOptions
 	// flags (which can be set via '--node-group-auto-discovery' or '-nodes')
-	provider, err := newDigitalOceanCloudProvider(manager, rl)
-	if err != nil {
-		klog.Fatalf("Failed to create DigitalOcean cloud provider: %v", err)
-	}
+	return newDigitalOceanCloudProvider(manager, rl)
+}
 
-	return provider
+// toProviderID returns a provider ID from the given node ID.
+func toProviderID(nodeID string) string {
+	return fmt.Sprintf("%s%s", doProviderIDPrefix, nodeID)
+}
+
+// toNodeID returns a node or droplet ID from the given provider ID.
+func toNodeID(providerID string) string {
+	return strings.TrimPrefix(providerID, doProviderIDPrefix)
 }

@@ -24,24 +24,25 @@ import (
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
-func TestMoreThen50Groups(t *testing.T) {
+func TestMoreThen100Groups(t *testing.T) {
 	service := &AutoScalingMock{}
 	autoScalingWrapper := &autoScalingWrapper{
 		autoScaling: service,
 	}
 
-	// Generate 51 ASG names
-	names := make([]string, 51)
+	// Generate 101 ASG names
+	names := make([]string, 101)
 	for i := 0; i < len(names); i++ {
 		names[i] = fmt.Sprintf("asg-%d", i)
 	}
 
-	// First batch, first 50 elements
+	// First batch, first 100 elements
 	service.On("DescribeAutoScalingGroupsPages",
 		&autoscaling.DescribeAutoScalingGroupsInput{
-			AutoScalingGroupNames: aws.StringSlice(names[:50]),
+			AutoScalingGroupNames: aws.StringSlice(names[:100]),
 			MaxRecords:            aws.Int64(maxRecordsReturnedByAPI),
 		},
 		mock.AnythingOfType("func(*autoscaling.DescribeAutoScalingGroupsOutput, bool) bool"),
@@ -50,10 +51,10 @@ func TestMoreThen50Groups(t *testing.T) {
 		fn(testNamedDescribeAutoScalingGroupsOutput("asg-1", 1, "test-instance-id"), false)
 	}).Return(nil)
 
-	// Second batch, element 51
+	// Second batch, element 101
 	service.On("DescribeAutoScalingGroupsPages",
 		&autoscaling.DescribeAutoScalingGroupsInput{
-			AutoScalingGroupNames: aws.StringSlice([]string{"asg-50"}),
+			AutoScalingGroupNames: aws.StringSlice([]string{"asg-100"}),
 			MaxRecords:            aws.Int64(maxRecordsReturnedByAPI),
 		},
 		mock.AnythingOfType("func(*autoscaling.DescribeAutoScalingGroupsOutput, bool) bool"),
@@ -67,4 +68,17 @@ func TestMoreThen50Groups(t *testing.T) {
 	assert.Equal(t, len(asgs), 2)
 	assert.Equal(t, *asgs[0].AutoScalingGroupName, "asg-1")
 	assert.Equal(t, *asgs[1].AutoScalingGroupName, "asg-2")
+}
+
+func TestLaunchConfigurationCache(t *testing.T) {
+	c := newLaunchConfigurationInstanceTypeCache()
+	err := c.Add(instanceTypeCachedObject{
+		name:         "123",
+		instanceType: "t2.medium",
+	})
+	require.NoError(t, err)
+	obj, ok, err := c.GetByKey("123")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "t2.medium", obj.(instanceTypeCachedObject).instanceType)
 }

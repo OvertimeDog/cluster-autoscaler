@@ -29,10 +29,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/server/mux"
+	"k8s.io/apiserver/pkg/server/routes"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	cloudBuilder "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/builder"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
@@ -42,6 +44,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
 	ca_processors "k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupset"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
@@ -53,8 +56,9 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	kube_flag "k8s.io/component-base/cli/flag"
 	componentbaseconfig "k8s.io/component-base/config"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/client/leaderelectionconfig"
+	"k8s.io/component-base/config/options"
+	"k8s.io/component-base/metrics/legacyregistry"
+	klog "k8s.io/klog/v2"
 )
 
 // MultiStringFlag is a flag for passing multiple parameters using same flag
@@ -155,23 +159,30 @@ var (
 		"Should CA ignore Mirror pods when calculating resource utilization for scaling down")
 
 	writeStatusConfigMapFlag         = flag.Bool("write-status-configmap", true, "Should CA write status information to a configmap")
+	statusConfigMapName              = flag.String("status-config-map-name", "cluster-autoscaler-status", "Status configmap name")
 	maxInactivityTimeFlag            = flag.Duration("max-inactivity", 10*time.Minute, "Maximum time from last recorded autoscaler activity before automatic restart")
 	maxFailingTimeFlag               = flag.Duration("max-failing-time", 15*time.Minute, "Maximum time from last recorded successful autoscaler run before automatic restart")
 	balanceSimilarNodeGroupsFlag     = flag.Bool("balance-similar-node-groups", false, "Detect similar node groups and balance the number of nodes between them")
 	nodeAutoprovisioningEnabled      = flag.Bool("node-autoprovisioning-enabled", false, "Should CA autoprovision node groups when needed")
 	maxAutoprovisionedNodeGroupCount = flag.Int("max-autoprovisioned-node-group-count", 15, "The maximum number of autoprovisioned groups in the cluster.")
 
-	unremovableNodeRecheckTimeout       = flag.Duration("unremovable-node-recheck-timeout", 5*time.Minute, "The timeout before we check again a node that couldn't be removed before")
-	expendablePodsPriorityCutoff        = flag.Int("expendable-pods-priority-cutoff", -10, "Pods with priority below cutoff will be expendable. They can be killed without any consideration during scale down and they don't cause scale up. Pods with null priority (PodPriority disabled) are non expendable.")
-	regional                            = flag.Bool("regional", false, "Cluster is regional.")
-	newPodScaleUpDelay                  = flag.Duration("new-pod-scale-up-delay", 0*time.Second, "Pods less than this old will not be considered for scale-up.")
-	filterOutSchedulablePodsUsesPacking = flag.Bool("filter-out-schedulable-pods-uses-packing", true,
-		"Filtering out schedulable pods before CA scale up by trying to pack the schedulable pods on free capacity on existing nodes."+
-			"Setting it to false employs a more lenient filtering approach that does not try to pack the pods on the nodes."+
-			"Pods with nominatedNodeName set are always filtered out.")
+	unremovableNodeRecheckTimeout = flag.Duration("unremovable-node-recheck-timeout", 5*time.Minute, "The timeout before we check again a node that couldn't be removed before")
+	expendablePodsPriorityCutoff  = flag.Int("expendable-pods-priority-cutoff", -10, "Pods with priority below cutoff will be expendable. They can be killed without any consideration during scale down and they don't cause scale up. Pods with null priority (PodPriority disabled) are non expendable.")
+	regional                      = flag.Bool("regional", false, "Cluster is regional.")
+	newPodScaleUpDelay            = flag.Duration("new-pod-scale-up-delay", 0*time.Second, "Pods less than this old will not be considered for scale-up.")
 
-	ignoreTaintsFlag         = multiStringFlag("ignore-taint", "Specifies a taint to ignore in node templates when considering to scale a node group")
-	awsUseStaticInstanceList = flag.Bool("aws-use-static-instance-list", false, "Should CA fetch instance types in runtime or use a static list. AWS only")
+	ignoreTaintsFlag                   = multiStringFlag("ignore-taint", "Specifies a taint to ignore in node templates when considering to scale a node group")
+	balancingIgnoreLabelsFlag          = multiStringFlag("balancing-ignore-label", "Specifies a label to ignore in addition to the basic and cloud-provider set of labels when comparing if two node groups are similar")
+	awsUseStaticInstanceList           = flag.Bool("aws-use-static-instance-list", false, "Should CA fetch instance types in runtime or use a static list. AWS only")
+	concurrentGceRefreshes             = flag.Int("gce-concurrent-refreshes", 1, "Maximum number of concurrent refreshes per cloud object type.")
+	enableProfiling                    = flag.Bool("profiling", false, "Is debug/pprof endpoint enabled")
+	clusterAPICloudConfigAuthoritative = flag.Bool("clusterapi-cloud-config-authoritative", false, "Treat the cloud-config flag authoritatively (do not fallback to using kubeconfig flag). ClusterAPI only")
+	cordonNodeBeforeTerminate          = flag.Bool("cordon-node-before-terminating", false, "Should CA cordon nodes before terminating during downscale process")
+	daemonSetEvictionForEmptyNodes     = flag.Bool("daemonset-eviction-for-empty-nodes", false, "DaemonSet pods will be gracefully terminated from empty nodes")
+	daemonSetEvictionForOccupiedNodes  = flag.Bool("daemonset-eviction-for-occupied-nodes", true, "DaemonSet pods will be gracefully terminated from non-empty nodes")
+	userAgent                          = flag.String("user-agent", "cluster-autoscaler", "User agent used for HTTP calls.")
+
+	emitPerNodeGroupMetrics = flag.Bool("emit-per-nodegroup-metrics", false, "If true, emit per node group metrics.")
 )
 
 func createAutoscalingOptions() config.AutoscalingOptions {
@@ -192,53 +203,63 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 		klog.Fatalf("Failed to parse flags: %v", err)
 	}
 	return config.AutoscalingOptions{
-		CloudConfig:                         *cloudConfig,
-		CloudProviderName:                   *cloudProviderFlag,
-		NodeGroupAutoDiscovery:              *nodeGroupAutoDiscoveryFlag,
-		MaxTotalUnreadyPercentage:           *maxTotalUnreadyPercentage,
-		OkTotalUnreadyCount:                 *okTotalUnreadyCount,
-		ScaleUpFromZero:                     *scaleUpFromZero,
-		EstimatorName:                       *estimatorFlag,
-		ExpanderName:                        *expanderFlag,
-		IgnoreDaemonSetsUtilization:         *ignoreDaemonSetsUtilization,
-		IgnoreMirrorPodsUtilization:         *ignoreMirrorPodsUtilization,
-		MaxBulkSoftTaintCount:               *maxBulkSoftTaintCount,
-		MaxBulkSoftTaintTime:                *maxBulkSoftTaintTime,
-		MaxEmptyBulkDelete:                  *maxEmptyBulkDeleteFlag,
-		MaxGracefulTerminationSec:           *maxGracefulTerminationFlag,
-		MaxNodeProvisionTime:                *maxNodeProvisionTime,
-		MaxNodesTotal:                       *maxNodesTotal,
-		MaxCoresTotal:                       maxCoresTotal,
-		MinCoresTotal:                       minCoresTotal,
-		MaxMemoryTotal:                      maxMemoryTotal,
-		MinMemoryTotal:                      minMemoryTotal,
-		GpuTotal:                            parsedGpuTotal,
-		NodeGroups:                          *nodeGroupsFlag,
-		ScaleDownDelayAfterAdd:              *scaleDownDelayAfterAdd,
-		ScaleDownDelayAfterDelete:           *scaleDownDelayAfterDelete,
-		ScaleDownDelayAfterFailure:          *scaleDownDelayAfterFailure,
-		ScaleDownEnabled:                    *scaleDownEnabled,
-		ScaleDownUnneededTime:               *scaleDownUnneededTime,
-		ScaleDownUnreadyTime:                *scaleDownUnreadyTime,
-		ScaleDownUtilizationThreshold:       *scaleDownUtilizationThreshold,
-		ScaleDownGpuUtilizationThreshold:    *scaleDownGpuUtilizationThreshold,
-		ScaleDownNonEmptyCandidatesCount:    *scaleDownNonEmptyCandidatesCount,
-		ScaleDownCandidatesPoolRatio:        *scaleDownCandidatesPoolRatio,
-		ScaleDownCandidatesPoolMinCount:     *scaleDownCandidatesPoolMinCount,
-		WriteStatusConfigMap:                *writeStatusConfigMapFlag,
-		BalanceSimilarNodeGroups:            *balanceSimilarNodeGroupsFlag,
-		ConfigNamespace:                     *namespace,
-		ClusterName:                         *clusterName,
-		NodeAutoprovisioningEnabled:         *nodeAutoprovisioningEnabled,
-		MaxAutoprovisionedNodeGroupCount:    *maxAutoprovisionedNodeGroupCount,
-		UnremovableNodeRecheckTimeout:       *unremovableNodeRecheckTimeout,
-		ExpendablePodsPriorityCutoff:        *expendablePodsPriorityCutoff,
-		Regional:                            *regional,
-		NewPodScaleUpDelay:                  *newPodScaleUpDelay,
-		FilterOutSchedulablePodsUsesPacking: *filterOutSchedulablePodsUsesPacking,
-		IgnoredTaints:                       *ignoreTaintsFlag,
-		NodeDeletionDelayTimeout:            *nodeDeletionDelayTimeout,
-		AWSUseStaticInstanceList:            *awsUseStaticInstanceList,
+		NodeGroupDefaults: config.NodeGroupAutoscalingOptions{
+			ScaleDownUtilizationThreshold:    *scaleDownUtilizationThreshold,
+			ScaleDownGpuUtilizationThreshold: *scaleDownGpuUtilizationThreshold,
+			ScaleDownUnneededTime:            *scaleDownUnneededTime,
+			ScaleDownUnreadyTime:             *scaleDownUnreadyTime,
+		},
+		CloudConfig:                        *cloudConfig,
+		CloudProviderName:                  *cloudProviderFlag,
+		NodeGroupAutoDiscovery:             *nodeGroupAutoDiscoveryFlag,
+		MaxTotalUnreadyPercentage:          *maxTotalUnreadyPercentage,
+		OkTotalUnreadyCount:                *okTotalUnreadyCount,
+		ScaleUpFromZero:                    *scaleUpFromZero,
+		EstimatorName:                      *estimatorFlag,
+		ExpanderName:                       *expanderFlag,
+		IgnoreDaemonSetsUtilization:        *ignoreDaemonSetsUtilization,
+		IgnoreMirrorPodsUtilization:        *ignoreMirrorPodsUtilization,
+		MaxBulkSoftTaintCount:              *maxBulkSoftTaintCount,
+		MaxBulkSoftTaintTime:               *maxBulkSoftTaintTime,
+		MaxEmptyBulkDelete:                 *maxEmptyBulkDeleteFlag,
+		MaxGracefulTerminationSec:          *maxGracefulTerminationFlag,
+		MaxNodeProvisionTime:               *maxNodeProvisionTime,
+		MaxNodesTotal:                      *maxNodesTotal,
+		MaxCoresTotal:                      maxCoresTotal,
+		MinCoresTotal:                      minCoresTotal,
+		MaxMemoryTotal:                     maxMemoryTotal,
+		MinMemoryTotal:                     minMemoryTotal,
+		GpuTotal:                           parsedGpuTotal,
+		NodeGroups:                         *nodeGroupsFlag,
+		ScaleDownDelayAfterAdd:             *scaleDownDelayAfterAdd,
+		ScaleDownDelayAfterDelete:          *scaleDownDelayAfterDelete,
+		ScaleDownDelayAfterFailure:         *scaleDownDelayAfterFailure,
+		ScaleDownEnabled:                   *scaleDownEnabled,
+		ScaleDownNonEmptyCandidatesCount:   *scaleDownNonEmptyCandidatesCount,
+		ScaleDownCandidatesPoolRatio:       *scaleDownCandidatesPoolRatio,
+		ScaleDownCandidatesPoolMinCount:    *scaleDownCandidatesPoolMinCount,
+		WriteStatusConfigMap:               *writeStatusConfigMapFlag,
+		StatusConfigMapName:                *statusConfigMapName,
+		BalanceSimilarNodeGroups:           *balanceSimilarNodeGroupsFlag,
+		ConfigNamespace:                    *namespace,
+		ClusterName:                        *clusterName,
+		NodeAutoprovisioningEnabled:        *nodeAutoprovisioningEnabled,
+		MaxAutoprovisionedNodeGroupCount:   *maxAutoprovisionedNodeGroupCount,
+		UnremovableNodeRecheckTimeout:      *unremovableNodeRecheckTimeout,
+		ExpendablePodsPriorityCutoff:       *expendablePodsPriorityCutoff,
+		Regional:                           *regional,
+		NewPodScaleUpDelay:                 *newPodScaleUpDelay,
+		IgnoredTaints:                      *ignoreTaintsFlag,
+		BalancingExtraIgnoredLabels:        *balancingIgnoreLabelsFlag,
+		KubeConfigPath:                     *kubeConfigFile,
+		NodeDeletionDelayTimeout:           *nodeDeletionDelayTimeout,
+		AWSUseStaticInstanceList:           *awsUseStaticInstanceList,
+		ConcurrentGceRefreshes:             *concurrentGceRefreshes,
+		ClusterAPICloudConfigAuthoritative: *clusterAPICloudConfigAuthoritative,
+		CordonNodeBeforeTerminate:          *cordonNodeBeforeTerminate,
+		DaemonSetEvictionForEmptyNodes:     *daemonSetEvictionForEmptyNodes,
+		DaemonSetEvictionForOccupiedNodes:  *daemonSetEvictionForOccupiedNodes,
+		UserAgent:                          *userAgent,
 	}
 }
 
@@ -290,32 +311,41 @@ func buildAutoscaler() (core.Autoscaler, error) {
 	kubeClient := createKubeClient(getKubeConfig())
 	eventsKubeClient := createKubeClient(getKubeConfig())
 
-	processors := ca_processors.DefaultProcessors()
-	processors.PodListProcessor = core.NewFilterOutSchedulablePodListProcessor()
-	if autoscalingOptions.CloudProviderName == cloudprovider.AzureProviderName {
-		processors.NodeGroupSetProcessor = &nodegroupset.BalancingNodeGroupSetProcessor{
-			Comparator: nodegroupset.IsAzureNodeInfoSimilar}
-	} else if autoscalingOptions.CloudProviderName == cloudprovider.AwsProviderName {
-		processors.NodeGroupSetProcessor = &nodegroupset.BalancingNodeGroupSetProcessor{
-			Comparator: nodegroupset.IsAwsNodeInfoSimilar}
-	}
-
 	opts := core.AutoscalerOptions{
 		AutoscalingOptions: autoscalingOptions,
+		ClusterSnapshot:    simulator.NewDeltaClusterSnapshot(),
 		KubeClient:         kubeClient,
 		EventsKubeClient:   eventsKubeClient,
-		Processors:         processors,
 	}
 
-	// This metric should be published only once.
+	opts.Processors = ca_processors.DefaultProcessors()
+	opts.Processors.PodListProcessor = core.NewFilterOutSchedulablePodListProcessor()
+
+	nodeInfoComparatorBuilder := nodegroupset.CreateGenericNodeInfoComparator
+	if autoscalingOptions.CloudProviderName == cloudprovider.AzureProviderName {
+		nodeInfoComparatorBuilder = nodegroupset.CreateAzureNodeInfoComparator
+	} else if autoscalingOptions.CloudProviderName == cloudprovider.AwsProviderName {
+		nodeInfoComparatorBuilder = nodegroupset.CreateAwsNodeInfoComparator
+	} else if autoscalingOptions.CloudProviderName == cloudprovider.GceProviderName {
+		nodeInfoComparatorBuilder = nodegroupset.CreateGceNodeInfoComparator
+	}
+
+	opts.Processors.NodeGroupSetProcessor = &nodegroupset.BalancingNodeGroupSetProcessor{
+		Comparator: nodeInfoComparatorBuilder(autoscalingOptions.BalancingExtraIgnoredLabels),
+	}
+
+	// These metrics should be published only once.
 	metrics.UpdateNapEnabled(autoscalingOptions.NodeAutoprovisioningEnabled)
+	metrics.UpdateMaxNodesCount(autoscalingOptions.MaxNodesTotal)
+	metrics.UpdateCPULimitsCores(autoscalingOptions.MinCoresTotal, autoscalingOptions.MaxCoresTotal)
+	metrics.UpdateMemoryLimitsBytes(autoscalingOptions.MinMemoryTotal, autoscalingOptions.MaxMemoryTotal)
 
 	// Create autoscaler.
 	return core.NewAutoscaler(opts)
 }
 
 func run(healthCheck *metrics.HealthCheck) {
-	metrics.RegisterAll()
+	metrics.RegisterAll(*emitPerNodeGroupMetrics)
 
 	autoscaler, err := buildAutoscaler()
 	if err != nil {
@@ -361,16 +391,25 @@ func main() {
 	leaderElection := defaultLeaderElectionConfiguration()
 	leaderElection.LeaderElect = true
 
-	leaderelectionconfig.BindFlags(&leaderElection, pflag.CommandLine)
+	options.BindLeaderElectionFlags(&leaderElection, pflag.CommandLine)
+	utilfeature.DefaultMutableFeatureGate.AddFlag(pflag.CommandLine)
 	kube_flag.InitFlags()
+
 	healthCheck := metrics.NewHealthCheck(*maxInactivityTimeFlag, *maxFailingTimeFlag)
 
 	klog.V(1).Infof("Cluster Autoscaler %s", version.ClusterAutoscalerVersion)
 
 	go func() {
-		http.Handle("/metrics", prometheus.Handler())
-		http.Handle("/health-check", healthCheck)
-		err := http.ListenAndServe(*address, nil)
+		pathRecorderMux := mux.NewPathRecorderMux("cluster-autoscaler")
+		defaultMetricsHandler := legacyregistry.Handler().ServeHTTP
+		pathRecorderMux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+			defaultMetricsHandler(w, req)
+		})
+		pathRecorderMux.HandleFunc("/health-check", healthCheck.ServeHTTP)
+		if *enableProfiling {
+			routes.Profiling{}.Install(pathRecorderMux)
+		}
+		err := http.ListenAndServe(*address, pathRecorderMux)
 		klog.Fatalf("Failed to start metrics: %v", err)
 	}()
 
@@ -385,7 +424,7 @@ func main() {
 		kubeClient := createKubeClient(getKubeConfig())
 
 		// Validate that the client is ok.
-		_, err = kubeClient.CoreV1().Nodes().List(metav1.ListOptions{})
+		_, err = kubeClient.CoreV1().Nodes().List(ctx.TODO(), metav1.ListOptions{})
 		if err != nil {
 			klog.Fatalf("Failed to get nodes from apiserver: %v", err)
 		}
@@ -393,7 +432,7 @@ func main() {
 		lock, err := resourcelock.New(
 			leaderElection.ResourceLock,
 			*namespace,
-			"cluster-autoscaler",
+			leaderElection.ResourceName,
 			kubeClient.CoreV1(),
 			kubeClient.CoordinationV1(),
 			resourcelock.ResourceLockConfig{
@@ -406,10 +445,11 @@ func main() {
 		}
 
 		leaderelection.RunOrDie(ctx.TODO(), leaderelection.LeaderElectionConfig{
-			Lock:          lock,
-			LeaseDuration: leaderElection.LeaseDuration.Duration,
-			RenewDeadline: leaderElection.RenewDeadline.Duration,
-			RetryPeriod:   leaderElection.RetryPeriod.Duration,
+			Lock:            lock,
+			LeaseDuration:   leaderElection.LeaseDuration.Duration,
+			RenewDeadline:   leaderElection.RenewDeadline.Duration,
+			RetryPeriod:     leaderElection.RetryPeriod.Duration,
+			ReleaseOnCancel: true,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(_ ctx.Context) {
 					// Since we are committing a suicide after losing
@@ -430,7 +470,8 @@ func defaultLeaderElectionConfiguration() componentbaseconfig.LeaderElectionConf
 		LeaseDuration: metav1.Duration{Duration: defaultLeaseDuration},
 		RenewDeadline: metav1.Duration{Duration: defaultRenewDeadline},
 		RetryPeriod:   metav1.Duration{Duration: defaultRetryPeriod},
-		ResourceLock:  resourcelock.EndpointsResourceLock,
+		ResourceLock:  resourcelock.LeasesResourceLock,
+		ResourceName:  "cluster-autoscaler",
 	}
 }
 

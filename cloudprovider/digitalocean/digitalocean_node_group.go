@@ -21,18 +21,15 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/digitalocean/godo"
 	apiv1 "k8s.io/api/core/v1"
+
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean/godo"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 const (
-	// These are internal DO values, not publicly available and configurable at
-	// this point.
-	minNodePoolSize = 1
-	maxNodePoolSize = 200
-
 	doksLabelNamespace = "doks.digitalocean.com"
 	nodeIDLabel        = doksLabelNamespace + "/node-id"
 )
@@ -84,13 +81,13 @@ func (n *NodeGroup) IncreaseSize(delta int) error {
 
 	targetSize := n.nodePool.Count + delta
 
-	if targetSize >= n.MaxSize() {
+	if targetSize > n.MaxSize() {
 		return fmt.Errorf("size increase is too large. current: %d desired: %d max: %d",
 			n.nodePool.Count, targetSize, n.MaxSize())
 	}
 
 	req := &godo.KubernetesNodePoolUpdateRequest{
-		Count: targetSize,
+		Count: &targetSize,
 	}
 
 	ctx := context.Background()
@@ -118,10 +115,10 @@ func (n *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	for _, node := range nodes {
 		nodeID, ok := node.Labels[nodeIDLabel]
 		if !ok {
-			// CA creates fake node objects to represent upcoming VMs that haven't
-			// registered as nodes yet. They have node.Spec.ProviderID set. Use
-			// that as nodeID.
-			nodeID = node.Spec.ProviderID
+			// CA creates fake node objects to represent upcoming VMs that
+			// haven't registered as nodes yet. We cannot delete the node at
+			// this point.
+			return fmt.Errorf("cannot delete node %q with provider ID %q on node pool %q: node ID label %q is missing", node.Name, node.Spec.ProviderID, n.id, nodeIDLabel)
 		}
 
 		_, err := n.client.DeleteNode(ctx, n.clusterID, n.id, nodeID, nil)
@@ -148,13 +145,13 @@ func (n *NodeGroup) DecreaseTargetSize(delta int) error {
 	}
 
 	targetSize := n.nodePool.Count + delta
-	if targetSize <= n.MinSize() {
+	if targetSize < n.MinSize() {
 		return fmt.Errorf("size decrease is too small. current: %d desired: %d min: %d",
 			n.nodePool.Count, targetSize, n.MinSize())
 	}
 
 	req := &godo.KubernetesNodePoolUpdateRequest{
-		Count: targetSize,
+		Count: &targetSize,
 	}
 
 	ctx := context.Background()
@@ -198,14 +195,14 @@ func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 	return toInstances(n.nodePool.Nodes), nil
 }
 
-// TemplateNodeInfo returns a schedulernodeinfo.NodeInfo structure of an empty
+// TemplateNodeInfo returns a schedulerframework.NodeInfo structure of an empty
 // (as if just started) node. This will be used in scale-up simulations to
 // predict what would a new node look like if a node group was expanded. The
 // returned NodeInfo is expected to have a fully populated Node object, with
 // all of the labels, capacity and allocatable information as well as all pods
 // that are started on the node by default, using manifest (most likely only
 // kube-proxy). Implementation optional.
-func (n *NodeGroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
+func (n *NodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
@@ -235,12 +232,18 @@ func (n *NodeGroup) Autoprovisioned() bool {
 	return false
 }
 
+// GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
+// NodeGroup. Returning a nil will result in using default options.
+func (n *NodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
+	return nil, cloudprovider.ErrNotImplemented
+}
+
 // toInstances converts a slice of *godo.KubernetesNode to
 // cloudprovider.Instance
 func toInstances(nodes []*godo.KubernetesNode) []cloudprovider.Instance {
-	instances := make([]cloudprovider.Instance, len(nodes))
-	for i, nd := range nodes {
-		instances[i] = toInstance(nd)
+	instances := make([]cloudprovider.Instance, 0, len(nodes))
+	for _, nd := range nodes {
+		instances = append(instances, toInstance(nd))
 	}
 	return instances
 }
@@ -249,7 +252,7 @@ func toInstances(nodes []*godo.KubernetesNode) []cloudprovider.Instance {
 // cloudprovider.Instance
 func toInstance(node *godo.KubernetesNode) cloudprovider.Instance {
 	return cloudprovider.Instance{
-		Id:     node.ID,
+		Id:     toProviderID(node.DropletID),
 		Status: toInstanceStatus(node.Status),
 	}
 }

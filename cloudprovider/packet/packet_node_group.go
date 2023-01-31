@@ -23,8 +23,9 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/klog"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
+	klog "k8s.io/klog/v2"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // packetNodeGroup implements NodeGroup interface from cluster-autoscaler/cloudprovider.
@@ -58,7 +59,7 @@ const (
 	waitForStatusTimeStep       = 30 * time.Second
 	waitForUpdateStatusTimeout  = 2 * time.Minute
 	waitForCompleteStatusTimout = 10 * time.Minute
-	scaleToZeroSupported        = false
+	scaleToZeroSupported        = true
 
 	// Time that the goroutine that first acquires clusterUpdateMutex
 	// in deleteNodes should wait for other synchronous calls to deleteNodes.
@@ -132,7 +133,7 @@ func (ng *packetNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	if cachedSize-len(ng.nodesToDelete)-len(nodes) < ng.MinSize() {
 		ng.nodesToDeleteMutex.Unlock()
 		klog.V(1).Infof("UnLocking nodesToDeleteMutex")
-		return fmt.Errorf("deleting nodes would take nodegroup below minimum size")
+		return fmt.Errorf("deleting nodes would take nodegroup below minimum size %d", ng.minSize)
 	}
 	// otherwise, add the nodes to the batch and release the lock
 	ng.nodesToDelete = append(ng.nodesToDelete, nodes...)
@@ -179,14 +180,6 @@ func (ng *packetNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 		nodeNames = append(nodeNames, node.Name)
 	}
 	klog.V(0).Infof("Deleting nodes: %v", nodeNames)
-
-	/*updatePossible, currentStatus, err := ng.magnumManager.canUpdate()
-	if err != nil {
-		return fmt.Errorf("could not check if cluster is ready to delete nodes: %v", err)
-	}
-	if !updatePossible {
-		return fmt.Errorf("can not delete nodes, cluster is in %s status", currentStatus)
-	}*/
 
 	// Double check that the total number of batched nodes for deletion will not take the node group below its minimum size
 	if cachedSize-len(nodes) < ng.MinSize() {
@@ -262,7 +255,7 @@ func (ng *packetNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (ng *packetNodeGroup) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error) {
+func (ng *packetNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	return ng.packetManager.templateNodeInfo(ng.id)
 }
 
@@ -300,4 +293,10 @@ func (ng *packetNodeGroup) MinSize() int {
 // TargetSize returns the target size of the node group.
 func (ng *packetNodeGroup) TargetSize() (int, error) {
 	return *ng.targetSize, nil
+}
+
+// GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
+// NodeGroup. Returning a nil will result in using default options.
+func (ng *packetNodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
+	return nil, cloudprovider.ErrNotImplemented
 }

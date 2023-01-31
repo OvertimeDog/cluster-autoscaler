@@ -17,77 +17,68 @@ limitations under the License.
 package azure
 
 import (
-	"testing"
-
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
+	"fmt"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2017-05-10/resources"
-	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/Azure/go-autorest/autorest/to"
+	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmssclient/mockvmssclient"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmssvmclient/mockvmssvmclient"
+
+	"github.com/Azure/go-autorest/autorest/azure"
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 )
 
 func newTestAzureManager(t *testing.T) *AzureManager {
-	vmssName := "test-asg"
-	skuName := "Standard_D4_v2"
-	location := "eastus"
-	var vmssCapacity int64 = 3
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
 
-	scaleSetsClient := &VirtualMachineScaleSetsClientMock{
-		FakeStore: map[string]map[string]compute.VirtualMachineScaleSet{
-			"test": {
-				"test-asg": {
-					Name: &vmssName,
-					Sku: &compute.Sku{
-						Capacity: &vmssCapacity,
-						Name:     &skuName,
-					},
-					VirtualMachineScaleSetProperties: &compute.VirtualMachineScaleSetProperties{},
-					Location:                         &location,
-				},
-			},
-		},
-	}
-
-	scaleSetsClient.On("CreateOrUpdateSync", mock.Anything, mock.Anything, mock.Anything).Run(
-		func(args mock.Arguments) {
-			resourceGroupName := args.Get(0).(string)
-			vmssName := args.Get(1).(string)
-			if _, ok := scaleSetsClient.FakeStore[args.Get(0).(string)]; !ok {
-				scaleSetsClient.FakeStore[resourceGroupName] = make(map[string]compute.VirtualMachineScaleSet)
-			}
-			scaleSetsClient.FakeStore[resourceGroupName][vmssName] = args.Get(2).(compute.VirtualMachineScaleSet)
-		}).Return(compute.VirtualMachineScaleSetsCreateOrUpdateFuture{}, nil)
+	expectedScaleSets := newTestVMSSList(3, "test-vmss", "eastus")
+	expectedVMSSVMs := newTestVMSSVMList(3)
+	mockVMSSClient := mockvmssclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().List(gomock.Any(), "rg").Return(expectedScaleSets, nil).AnyTimes()
+	mockVMSSVMClient := mockvmssvmclient.NewMockInterface(ctrl)
+	mockVMSSVMClient.EXPECT().List(gomock.Any(), "rg", "test-vmss", gomock.Any()).Return(expectedVMSSVMs, nil).AnyTimes()
 
 	manager := &AzureManager{
 		env:                  azure.PublicCloud,
 		explicitlyConfigured: make(map[string]bool),
 		config: &Config{
-			ResourceGroup: "test",
-			VMType:        vmTypeVMSS,
+			ResourceGroup:       "rg",
+			VMType:              vmTypeVMSS,
+			MaxDeploymentsCount: 2,
+			Deployment:          "deployment",
 		},
-
 		azClient: &azClient{
-			disksClient:           &DisksClientMock{},
-			interfacesClient:      &InterfacesClientMock{},
-			storageAccountsClient: &AccountsClientMock{},
+			virtualMachineScaleSetsClient:   mockVMSSClient,
+			virtualMachineScaleSetVMsClient: mockVMSSVMClient,
 			deploymentsClient: &DeploymentsClientMock{
-				FakeStore: make(map[string]resources.DeploymentExtended),
+				FakeStore: map[string]resources.DeploymentExtended{
+					"deployment": {
+						Name: to.StringPtr("deployment"),
+						Properties: &resources.DeploymentPropertiesExtended{Template: map[string]interface{}{
+							resourcesFieldName: []interface{}{
+								map[string]interface{}{
+									typeFieldName: nsgResourceType,
+								},
+								map[string]interface{}{
+									typeFieldName: rtResourceType,
+								},
+							},
+						}},
+					},
+				},
 			},
-			virtualMachinesClient: &VirtualMachinesClientMock{
-				FakeStore: make(map[string]map[string]compute.VirtualMachine),
-			},
-			virtualMachineScaleSetsClient:   scaleSetsClient,
-			virtualMachineScaleSetVMsClient: &VirtualMachineScaleSetVMsClientMock{},
 		},
 	}
 
-	cache, error := newAsgCache(int64(defaultAsgCacheTTL))
+	cache, error := newAzureCache(manager.azClient, refreshInterval, manager.config.ResourceGroup, vmTypeVMSS)
 	assert.NoError(t, error)
 
-	manager.asgCache = cache
+	manager.azureCache = cache
 	return manager
 }
 
@@ -121,26 +112,40 @@ func TestNodeGroups(t *testing.T) {
 	provider := newTestProvider(t)
 	assert.Equal(t, len(provider.NodeGroups()), 0)
 
-	registered := provider.azureManager.RegisterAsg(
+	registered := provider.azureManager.RegisterNodeGroup(
 		newTestScaleSet(provider.azureManager, "test-asg"))
 	assert.True(t, registered)
 	assert.Equal(t, len(provider.NodeGroups()), 1)
 }
 
 func TestNodeGroupForNode(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	expectedVMSSVMs := newTestVMSSVMList(3)
+	expectedScaleSets := newTestVMSSList(3, "test-asg", "eastus")
+
 	provider := newTestProvider(t)
-	registered := provider.azureManager.RegisterAsg(
+	mockVMSSClient := mockvmssclient.NewMockInterface(ctrl)
+	mockVMSSClient.EXPECT().List(gomock.Any(), provider.azureManager.config.ResourceGroup).Return(expectedScaleSets, nil)
+	provider.azureManager.azClient.virtualMachineScaleSetsClient = mockVMSSClient
+	mockVMSSVMClient := mockvmssvmclient.NewMockInterface(ctrl)
+	mockVMSSVMClient.EXPECT().List(gomock.Any(), provider.azureManager.config.ResourceGroup, "test-asg", gomock.Any()).Return(expectedVMSSVMs, nil).AnyTimes()
+	provider.azureManager.azClient.virtualMachineScaleSetVMsClient = mockVMSSVMClient
+
+	registered := provider.azureManager.RegisterNodeGroup(
 		newTestScaleSet(provider.azureManager, "test-asg"))
+	provider.azureManager.explicitlyConfigured["test-asg"] = true
 	assert.True(t, registered)
 	assert.Equal(t, len(provider.NodeGroups()), 1)
 
 	node := &apiv1.Node{
 		Spec: apiv1.NodeSpec{
-			ProviderID: "azure://" + fakeVirtualMachineScaleSetVMID,
+			ProviderID: "azure://" + fmt.Sprintf(fakeVirtualMachineScaleSetVMID, 0),
 		},
 	}
 	// refresh cache
-	provider.azureManager.regenerateCache()
+	provider.azureManager.forceRefresh()
 	group, err := provider.NodeGroupForNode(node)
 	assert.NoError(t, err)
 	assert.NotNil(t, group, "Group should not be nil")
@@ -161,7 +166,7 @@ func TestNodeGroupForNode(t *testing.T) {
 
 func TestNodeGroupForNodeWithNoProviderId(t *testing.T) {
 	provider := newTestProvider(t)
-	registered := provider.azureManager.RegisterAsg(
+	registered := provider.azureManager.RegisterNodeGroup(
 		newTestScaleSet(provider.azureManager, "test-asg"))
 	assert.True(t, registered)
 	assert.Equal(t, len(provider.NodeGroups()), 1)

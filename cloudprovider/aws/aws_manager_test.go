@@ -17,6 +17,7 @@ limitations under the License.
 package aws
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/stretchr/testify/assert"
@@ -36,7 +38,6 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 	provider_aws "k8s.io/legacy-cloud-providers/aws"
 )
 
@@ -57,13 +58,13 @@ func TestGetRegion(t *testing.T) {
 	expected1 := "the-shire-1"
 	os.Setenv(key, expected1)
 	assert.Equal(t, expected1, getRegion())
-	// Ensure without environment variable, EC2 Metadata used... and it merely
-	// chops the last character off the Availability Zone.
+	// Ensure without environment variable, EC2 Metadata is used.
 	expected2 := "mordor-2"
-	expected2a := expected2 + "a"
+	expectedjson := ec2metadata.EC2InstanceIdentityDocument{Region: expected2}
+	js, _ := json.Marshal(expectedjson)
 	os.Unsetenv(key)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(expected2a))
+		w.Write(js)
 	}))
 	cfg := aws.NewConfig().WithEndpoint(server.URL)
 	assert.Equal(t, expected2, getRegion(cfg))
@@ -75,14 +76,15 @@ func TestBuildGenericLabels(t *testing.T) {
 			InstanceType: "c4.large",
 			VCPU:         2,
 			MemoryMb:     3840,
+			Architecture: cloudprovider.DefaultArch,
 		},
 		Region: "us-east-1",
 	}, "sillyname")
-	assert.Equal(t, "us-east-1", labels[apiv1.LabelZoneRegion])
+	assert.Equal(t, "us-east-1", labels[apiv1.LabelZoneRegionStable])
 	assert.Equal(t, "sillyname", labels[apiv1.LabelHostname])
-	assert.Equal(t, "c4.large", labels[apiv1.LabelInstanceType])
-	assert.Equal(t, cloudprovider.DefaultArch, labels[kubeletapis.LabelArch])
-	assert.Equal(t, cloudprovider.DefaultOS, labels[kubeletapis.LabelOS])
+	assert.Equal(t, "c4.large", labels[apiv1.LabelInstanceTypeStable])
+	assert.Equal(t, cloudprovider.DefaultArch, labels[apiv1.LabelArchStable])
+	assert.Equal(t, cloudprovider.DefaultOS, labels[apiv1.LabelOSStable])
 }
 
 func TestExtractAllocatableResourcesFromAsg(t *testing.T) {
@@ -301,8 +303,8 @@ func TestFetchExplicitAsgs(t *testing.T) {
 	// #1449 Without AWS_REGION getRegion() lookup runs till timeout during tests.
 	defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 	os.Setenv("AWS_REGION", "fanghorn")
-	// fetchExplicitASGs is called at manager creation time.
-	m, err := createAWSManagerInternal(nil, do, &autoScalingWrapper{s, map[string]string{}}, nil)
+	instanceTypes, _ := GetStaticEC2InstanceTypes()
+	m, err := createAWSManagerInternal(nil, do, &autoScalingWrapper{s, newLaunchConfigurationInstanceTypeCache()}, nil, instanceTypes)
 	assert.NoError(t, err)
 
 	asgs := m.asgCache.Get()
@@ -330,7 +332,8 @@ func TestBuildInstanceType(t *testing.T) {
 	// #1449 Without AWS_REGION getRegion() lookup runs till timeout during tests.
 	defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 	os.Setenv("AWS_REGION", "fanghorn")
-	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s})
+	instanceTypes, _ := GetStaticEC2InstanceTypes()
+	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s}, instanceTypes)
 	assert.NoError(t, err)
 
 	asg := asg{
@@ -345,7 +348,7 @@ func TestBuildInstanceType(t *testing.T) {
 
 func TestBuildInstanceTypeMixedInstancePolicyOverride(t *testing.T) {
 	ltName, ltVersion, instanceType := "launcher", "1", "t2.large"
-	instanceTypes := []string{}
+	instanceTypeOverrides := []string{}
 
 	s := &EC2Mock{}
 	s.On("DescribeLaunchTemplateVersions", &ec2.DescribeLaunchTemplateVersionsInput{
@@ -363,14 +366,15 @@ func TestBuildInstanceTypeMixedInstancePolicyOverride(t *testing.T) {
 
 	defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 	os.Setenv("AWS_REGION", "fanghorn")
-	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s})
+	instanceTypes, _ := GetStaticEC2InstanceTypes()
+	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s}, instanceTypes)
 	assert.NoError(t, err)
 
 	lt := &launchTemplate{name: ltName, version: ltVersion}
 	asg := asg{
 		MixedInstancesPolicy: &mixedInstancesPolicy{
 			launchTemplate:         lt,
-			instanceTypesOverrides: instanceTypes,
+			instanceTypesOverrides: instanceTypeOverrides,
 		},
 	}
 
@@ -382,25 +386,26 @@ func TestBuildInstanceTypeMixedInstancePolicyOverride(t *testing.T) {
 
 func TestBuildInstanceTypeMixedInstancePolicyNoOverride(t *testing.T) {
 	ltName, ltVersion := "launcher", "1"
-	instanceTypes := []string{"m4.xlarge", "m5.xlarge"}
+	instanceTypeOverrides := []string{"m4.xlarge", "m5.xlarge"}
 
 	defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 	os.Setenv("AWS_REGION", "fanghorn")
-	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{})
+	instanceTypes, _ := GetStaticEC2InstanceTypes()
+	m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{}, instanceTypes)
 	assert.NoError(t, err)
 
 	lt := &launchTemplate{name: ltName, version: ltVersion}
 	asg := asg{
 		MixedInstancesPolicy: &mixedInstancesPolicy{
 			launchTemplate:         lt,
-			instanceTypesOverrides: instanceTypes,
+			instanceTypesOverrides: instanceTypeOverrides,
 		},
 	}
 
 	builtInstanceType, err := m.buildInstanceType(&asg)
 
 	assert.NoError(t, err)
-	assert.Equal(t, instanceTypes[0], builtInstanceType)
+	assert.Equal(t, instanceTypeOverrides[0], builtInstanceType)
 }
 
 func TestGetASGTemplate(t *testing.T) {
@@ -454,7 +459,8 @@ func TestGetASGTemplate(t *testing.T) {
 			// #1449 Without AWS_REGION getRegion() lookup runs till timeout during tests.
 			defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 			os.Setenv("AWS_REGION", "fanghorn")
-			m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s})
+			instanceTypes, _ := GetStaticEC2InstanceTypes()
+			m, err := createAWSManagerInternal(nil, cloudprovider.NodeGroupDiscoveryOptions{}, nil, &ec2Wrapper{s}, instanceTypes)
 			assert.NoError(t, err)
 
 			asg := &asg{
@@ -536,7 +542,8 @@ func TestFetchAutoAsgs(t *testing.T) {
 	defer resetAWSRegion(os.LookupEnv("AWS_REGION"))
 	os.Setenv("AWS_REGION", "fanghorn")
 	// fetchAutoASGs is called at manager creation time, via forceRefresh
-	m, err := createAWSManagerInternal(nil, do, &autoScalingWrapper{s, map[string]string{}}, nil)
+	instanceTypes, _ := GetStaticEC2InstanceTypes()
+	m, err := createAWSManagerInternal(nil, do, &autoScalingWrapper{s, newLaunchConfigurationInstanceTypeCache()}, nil, instanceTypes)
 	assert.NoError(t, err)
 
 	asgs := m.asgCache.Get()
@@ -845,4 +852,65 @@ func flatTagSlice(filters []*autoscaling.Filter) []string {
 	// Sort slice for compare
 	sort.Strings(tags)
 	return tags
+}
+
+func TestParseASGAutoDiscoverySpecs(t *testing.T) {
+	cases := []struct {
+		name    string
+		specs   []string
+		want    []asgAutoDiscoveryConfig
+		wantErr bool
+	}{
+		{
+			name: "GoodSpecs",
+			specs: []string{
+				"asg:tag=tag,anothertag",
+				"asg:tag=cooltag,anothertag",
+				"asg:tag=label=value,anothertag",
+			},
+			want: []asgAutoDiscoveryConfig{
+				{Tags: map[string]string{"tag": "", "anothertag": ""}},
+				{Tags: map[string]string{"cooltag": "", "anothertag": ""}},
+				{Tags: map[string]string{"label": "value", "anothertag": ""}},
+			},
+		},
+		{
+			name:    "MissingASGType",
+			specs:   []string{"tag=tag,anothertag"},
+			wantErr: true,
+		},
+		{
+			name:    "WrongType",
+			specs:   []string{"mig:tag=tag,anothertag"},
+			wantErr: true,
+		},
+		{
+			name:    "KeyMissingValue",
+			specs:   []string{"asg:tag="},
+			wantErr: true,
+		},
+		{
+			name:    "ValueMissingKey",
+			specs:   []string{"asg:=tag"},
+			wantErr: true,
+		},
+		{
+			name:    "KeyMissingSeparator",
+			specs:   []string{"asg:tag"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			do := cloudprovider.NodeGroupDiscoveryOptions{NodeGroupAutoDiscoverySpecs: tc.specs}
+			got, err := parseASGAutoDiscoverySpecs(do)
+			if tc.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.True(t, assert.ObjectsAreEqualValues(tc.want, got), "\ngot: %#v\nwant: %#v", got, tc.want)
+		})
+	}
 }

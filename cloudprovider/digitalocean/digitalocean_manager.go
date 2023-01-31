@@ -17,26 +17,17 @@ limitations under the License.
 package digitalocean
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"strconv"
-	"strings"
 
+	"github.com/digitalocean/godo"
 	"golang.org/x/oauth2"
-
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean/godo"
-	"k8s.io/klog"
-)
-
-const (
-	tagPrefix  = "k8s-cluster-autoscaler-"
-	tagEnabled = tagPrefix + "enabled:"
-	tagMin     = tagPrefix + "min:"
-	tagMax     = tagPrefix + "max:"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -72,6 +63,10 @@ type Config struct {
 	// DigitalOcean Cluster Autoscaler is running.
 	Token string `json:"token"`
 
+	// TokenFile references the token from the given file. It cannot be specified
+	// together with Token.
+	TokenFile string `json:"token_file"`
+
 	// URL points to DigitalOcean API. If empty, defaults to
 	// https://api.digitalocean.com/
 	URL string `json:"url"`
@@ -90,11 +85,26 @@ func newManager(configReader io.Reader) (*Manager, error) {
 		}
 	}
 
-	if cfg.Token == "" {
+	if cfg.Token == "" && cfg.TokenFile == "" {
 		return nil, errors.New("access token is not provided")
+	}
+	if cfg.Token != "" && cfg.TokenFile != "" {
+		return nil, errors.New("access token literal and access token file must not be provided together")
 	}
 	if cfg.ClusterID == "" {
 		return nil, errors.New("cluster ID is not provided")
+	}
+
+	if cfg.TokenFile != "" {
+		tokenData, err := ioutil.ReadFile(cfg.TokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read token file: %s", err)
+		}
+		tokenData = bytes.TrimSpace(tokenData)
+		if len(tokenData) == 0 {
+			return nil, fmt.Errorf("token file %q is empty", cfg.TokenFile)
+		}
+		cfg.Token = string(tokenData)
 	}
 
 	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{
@@ -134,39 +144,20 @@ func (m *Manager) Refresh() error {
 
 	var group []*NodeGroup
 	for _, nodePool := range nodePools {
-		spec, err := parseTags(nodePool.Tags)
-		if err != nil {
-			// we should not return an error here, because one misconfigured
-			// node pool shouldn't bring down the whole cluster-autoscaler
-			klog.V(4).Infof("skipping misconfigured node pool: %q name: %s tags: %+v err: %s",
-				nodePool.ID, nodePool.Name, nodePool.Tags, err)
+		if !nodePool.AutoScale {
 			continue
-		}
-
-		if !spec.enabled {
-			continue
-		}
-
-		minSize := minNodePoolSize
-		if spec.min != 0 {
-			minSize = spec.min
-		}
-
-		maxSize := maxNodePoolSize
-		if spec.max != 0 {
-			maxSize = spec.max
 		}
 
 		klog.V(4).Infof("adding node pool: %q name: %s min: %d max: %d",
-			nodePool.ID, nodePool.Name, minSize, maxSize)
+			nodePool.ID, nodePool.Name, nodePool.MinNodes, nodePool.MaxNodes)
 
 		group = append(group, &NodeGroup{
 			id:        nodePool.ID,
 			clusterID: m.clusterID,
 			client:    m.client,
 			nodePool:  nodePool,
-			minSize:   minSize,
-			maxSize:   maxSize,
+			minSize:   nodePool.MinNodes,
+			maxSize:   nodePool.MaxNodes,
 		})
 	}
 
@@ -176,65 +167,4 @@ func (m *Manager) Refresh() error {
 
 	m.nodeGroups = group
 	return nil
-}
-
-// nodeSpec defines a custom specification for a given node
-type nodeSpec struct {
-	min     int
-	max     int
-	enabled bool
-}
-
-// parseTags parses a list of tags from a DigitalOcean node pool
-func parseTags(tags []string) (*nodeSpec, error) {
-	spec := &nodeSpec{}
-
-	for _, tag := range tags {
-		if !strings.HasPrefix(tag, tagPrefix) {
-			continue
-		}
-
-		splitted := strings.Split(strings.TrimPrefix(tag, tagPrefix), ":")
-		if len(splitted) != 2 {
-			return nil, fmt.Errorf("malformed tag: %q", tag)
-		}
-
-		key, value := splitted[0], splitted[1]
-
-		switch key {
-		case "enabled":
-			if value == "true" {
-				spec.enabled = true
-			}
-		case "min":
-			min, err := strconv.Atoi(value)
-			if err != nil {
-				return nil, fmt.Errorf("invalid minimum nodes: %q", value)
-			}
-
-			if min <= 0 {
-				return nil, fmt.Errorf("minimum nodes: %d can't be set to zero or less", min)
-			}
-
-			spec.min = min
-		case "max":
-			max, err := strconv.Atoi(value)
-			if err != nil {
-				return nil, fmt.Errorf("invalid maximum nodes: %q", value)
-			}
-
-			if max <= 0 {
-				return nil, fmt.Errorf("maximum nodes: %d can't be set to zero or less", max)
-			}
-
-			spec.max = max
-		}
-	}
-
-	if spec.min != 0 && spec.max != 0 && spec.min > spec.max {
-		return nil, fmt.Errorf("minimum nodes: %d can't be higher than maximum nodes: %d",
-			spec.min, spec.max)
-	}
-
-	return spec, nil
 }

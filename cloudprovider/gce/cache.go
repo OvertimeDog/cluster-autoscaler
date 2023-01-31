@@ -17,21 +17,28 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/client-go/util/workqueue"
 
 	gce "google.golang.org/api/compute/v1"
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 )
 
 // MachineTypeKey is used to identify MachineType.
 type MachineTypeKey struct {
 	Zone        string
 	MachineType string
+}
+
+type machinesCacheValue struct {
+	machineType *gce.MachineType
+	err         error
 }
 
 // GceCache is used for caching cluster resources state.
@@ -58,28 +65,32 @@ type GceCache struct {
 	cacheMutex sync.Mutex
 
 	// Cache content.
-	migs                   map[GceRef]Mig
-	instanceRefToMigRef    map[GceRef]GceRef
-	resourceLimiter        *cloudprovider.ResourceLimiter
-	machinesCache          map[MachineTypeKey]*gce.MachineType
-	migTargetSizeCache     map[GceRef]int64
-	migBaseNameCache       map[GceRef]string
-	instanceTemplatesCache map[GceRef]*gce.InstanceTemplate
+	migs                     map[GceRef]Mig
+	instanceRefToMigRef      map[GceRef]GceRef
+	instancesFromUnknownMigs map[GceRef]struct{}
+	resourceLimiter          *cloudprovider.ResourceLimiter
+	machinesCache            map[MachineTypeKey]machinesCacheValue
+	migTargetSizeCache       map[GceRef]int64
+	migBaseNameCache         map[GceRef]string
+	instanceTemplatesCache   map[GceRef]*gce.InstanceTemplate
+	concurrentGceRefreshes   int
 
 	// Service used to refresh cache.
 	GceService AutoscalingGceClient
 }
 
 // NewGceCache creates empty GceCache.
-func NewGceCache(gceService AutoscalingGceClient) *GceCache {
+func NewGceCache(gceService AutoscalingGceClient, concurrentGceRefreshes int) *GceCache {
 	return &GceCache{
-		migs:                   map[GceRef]Mig{},
-		instanceRefToMigRef:    map[GceRef]GceRef{},
-		machinesCache:          map[MachineTypeKey]*gce.MachineType{},
-		migTargetSizeCache:     map[GceRef]int64{},
-		migBaseNameCache:       map[GceRef]string{},
-		instanceTemplatesCache: map[GceRef]*gce.InstanceTemplate{},
-		GceService:             gceService,
+		migs:                     map[GceRef]Mig{},
+		instanceRefToMigRef:      map[GceRef]GceRef{},
+		instancesFromUnknownMigs: map[GceRef]struct{}{},
+		machinesCache:            map[MachineTypeKey]machinesCacheValue{},
+		migTargetSizeCache:       map[GceRef]int64{},
+		migBaseNameCache:         map[GceRef]string{},
+		instanceTemplatesCache:   map[GceRef]*gce.InstanceTemplate{},
+		GceService:               gceService,
+		concurrentGceRefreshes:   concurrentGceRefreshes,
 	}
 }
 
@@ -114,7 +125,7 @@ func (gc *GceCache) UnregisterMig(toBeRemoved Mig) bool {
 	if found {
 		klog.V(1).Infof("Unregistered Mig %s", toBeRemoved.GceRef().String())
 		delete(gc.migs, toBeRemoved.GceRef())
-		gc.removeInstancesForMig(toBeRemoved.GceRef())
+		gc.removeInstancesForMigs(toBeRemoved.GceRef())
 		return true
 	}
 	return false
@@ -157,6 +168,8 @@ func (gc *GceCache) GetMigForInstance(instanceRef GceRef) (Mig, error) {
 			return nil, fmt.Errorf("instance %+v belongs to unregistered mig %+v", instanceRef, migRef)
 		}
 		return mig, nil
+	} else if _, found := gc.instancesFromUnknownMigs[instanceRef]; found {
+		return nil, nil
 	}
 
 	for _, migRef := range gc.getMigRefs() {
@@ -182,7 +195,9 @@ func (gc *GceCache) GetMigForInstance(instanceRef GceRef) (Mig, error) {
 
 			migRef, found := gc.instanceRefToMigRef[instanceRef]
 			if !found {
-				return nil, fmt.Errorf("instance %+v belongs to unknown mig", instanceRef)
+				klog.Warningf("instance %+v belongs to unknown mig", instanceRef)
+				gc.instancesFromUnknownMigs[instanceRef] = struct{}{}
+				return nil, nil
 			}
 			mig, found := gc.getMigNoLock(migRef)
 			if !found {
@@ -195,10 +210,11 @@ func (gc *GceCache) GetMigForInstance(instanceRef GceRef) (Mig, error) {
 	return nil, nil
 }
 
-func (gc *GceCache) removeInstancesForMig(migRef GceRef) {
+func (gc *GceCache) removeInstancesForMigs(migRef GceRef) {
 	for instanceRef, instanceMigRef := range gc.instanceRefToMigRef {
 		if migRef == instanceMigRef {
 			delete(gc.instanceRefToMigRef, instanceRef)
+			delete(gc.instancesFromUnknownMigs, instanceRef)
 		}
 	}
 }
@@ -210,22 +226,36 @@ func (gc *GceCache) getMigNoLock(migRef GceRef) (mig Mig, found bool) {
 
 // RegenerateInstanceCacheForMig triggers instances cache regeneration for single MIG under lock.
 func (gc *GceCache) RegenerateInstanceCacheForMig(migRef GceRef) error {
-	gc.cacheMutex.Lock()
-	defer gc.cacheMutex.Unlock()
-	return gc.regenerateInstanceCacheForMigNoLock(migRef)
-}
-
-func (gc *GceCache) regenerateInstanceCacheForMigNoLock(migRef GceRef) error {
 	klog.V(4).Infof("Regenerating MIG information for %s", migRef.String())
-
-	// cleanup old entries
-	gc.removeInstancesForMig(migRef)
 
 	instances, err := gc.GceService.FetchMigInstances(migRef)
 	if err != nil {
 		klog.V(4).Infof("Failed MIG info request for %s: %v", migRef.String(), err)
 		return err
 	}
+
+	gc.cacheMutex.Lock()
+	defer gc.cacheMutex.Unlock()
+
+	return gc.updateInstanceRefToMigRef(migRef, instances)
+}
+
+func (gc *GceCache) regenerateInstanceCacheForMigNoLock(migRef GceRef) error {
+	klog.V(4).Infof("Regenerating MIG information for %s", migRef.String())
+
+	instances, err := gc.GceService.FetchMigInstances(migRef)
+	if err != nil {
+		klog.V(4).Infof("Failed MIG info request for %s: %v", migRef.String(), err)
+		return err
+	}
+
+	return gc.updateInstanceRefToMigRef(migRef, instances)
+}
+
+func (gc *GceCache) updateInstanceRefToMigRef(migRef GceRef, instances []cloudprovider.Instance) error {
+	// cleanup old entries
+	gc.removeInstancesForMigs(migRef)
+
 	for _, instance := range instances {
 		instanceRef, err := GceRefFromProviderId(instance.Id)
 		if err != nil {
@@ -238,16 +268,25 @@ func (gc *GceCache) regenerateInstanceCacheForMigNoLock(migRef GceRef) error {
 
 // RegenerateInstancesCache triggers instances cache regeneration under lock.
 func (gc *GceCache) RegenerateInstancesCache() error {
-	gc.cacheMutex.Lock()
-	defer gc.cacheMutex.Unlock()
-
 	gc.instanceRefToMigRef = make(map[GceRef]GceRef)
-	for _, migRef := range gc.getMigRefs() {
-		err := gc.regenerateInstanceCacheForMigNoLock(migRef)
+	gc.instancesFromUnknownMigs = make(map[GceRef]struct{})
+
+	migs := gc.getMigRefs()
+	errors := make([]error, len(migs))
+	ctx, cancel := context.WithCancel(context.Background())
+	workqueue.ParallelizeUntil(ctx, gc.concurrentGceRefreshes, len(migs), func(piece int) {
+		errors[piece] = gc.RegenerateInstanceCacheForMig(migs[piece])
+		if errors[piece] != nil {
+			cancel()
+		}
+	}, workqueue.WithChunkSize(gc.concurrentGceRefreshes))
+
+	for _, err := range errors {
 		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -348,11 +387,18 @@ func (gc *GceCache) InvalidateAllMigInstanceTemplates() {
 }
 
 // GetMachineFromCache retrieves machine type from cache under lock.
-func (gc *GceCache) GetMachineFromCache(machineType string, zone string) *gce.MachineType {
+func (gc *GceCache) GetMachineFromCache(machineType string, zone string) (*gce.MachineType, error) {
 	gc.cacheMutex.Lock()
 	defer gc.cacheMutex.Unlock()
 
-	return gc.machinesCache[MachineTypeKey{zone, machineType}]
+	cv, ok := gc.machinesCache[MachineTypeKey{zone, machineType}]
+	if !ok {
+		return nil, nil
+	}
+	if cv.err != nil {
+		return nil, cv.err
+	}
+	return cv.machineType, nil
 }
 
 // AddMachineToCache adds machine to cache under lock.
@@ -360,7 +406,15 @@ func (gc *GceCache) AddMachineToCache(machineType string, zone string, machine *
 	gc.cacheMutex.Lock()
 	defer gc.cacheMutex.Unlock()
 
-	gc.machinesCache[MachineTypeKey{zone, machineType}] = machine
+	gc.machinesCache[MachineTypeKey{zone, machineType}] = machinesCacheValue{machineType: machine}
+}
+
+// AddMachineToCacheWithError adds machine to cache under lock.
+func (gc *GceCache) AddMachineToCacheWithError(machineType string, zone string, err error) {
+	gc.cacheMutex.Lock()
+	defer gc.cacheMutex.Unlock()
+
+	gc.machinesCache[MachineTypeKey{zone, machineType}] = machinesCacheValue{err: err}
 }
 
 // SetMachinesCache sets the machines cache under lock.
@@ -368,7 +422,10 @@ func (gc *GceCache) SetMachinesCache(machinesCache map[MachineTypeKey]*gce.Machi
 	gc.cacheMutex.Lock()
 	defer gc.cacheMutex.Unlock()
 
-	gc.machinesCache = machinesCache
+	gc.machinesCache = map[MachineTypeKey]machinesCacheValue{}
+	for k, v := range machinesCache {
+		gc.machinesCache[k] = machinesCacheValue{machineType: v}
+	}
 }
 
 // SetMigBasename sets basename for given mig in cache

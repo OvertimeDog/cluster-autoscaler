@@ -22,12 +22,13 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/digitalocean/godo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/digitalocean/godo"
 )
 
 func TestNodeGroup_TargetSize(t *testing.T) {
@@ -52,20 +53,53 @@ func TestNodeGroup_IncreaseSize(t *testing.T) {
 		numberOfNodes := 3
 		client := &doClientMock{}
 		ng := testNodeGroup(client, &godo.KubernetesNodePool{
-			Count: numberOfNodes,
+			Count:    numberOfNodes,
+			MinNodes: 1,
+			MaxNodes: 10,
 		})
 
 		delta := 2
 
+		newCount := numberOfNodes + delta
 		client.On("UpdateNodePool",
 			ctx,
 			ng.clusterID,
 			ng.id,
 			&godo.KubernetesNodePoolUpdateRequest{
-				Count: numberOfNodes + delta,
+				Count: &newCount,
 			},
 		).Return(
-			&godo.KubernetesNodePool{Count: numberOfNodes + delta},
+			&godo.KubernetesNodePool{Count: newCount},
+			&godo.Response{},
+			nil,
+		).Once()
+
+		err := ng.IncreaseSize(delta)
+		assert.NoError(t, err)
+	})
+
+	t.Run("successful increase to maximum", func(t *testing.T) {
+		numberOfNodes := 2
+		maxNodes := 3
+		client := &doClientMock{}
+		ng := testNodeGroup(client, &godo.KubernetesNodePool{
+			Count:     numberOfNodes,
+			AutoScale: true,
+			MinNodes:  1,
+			MaxNodes:  maxNodes,
+		})
+
+		delta := 1
+		newCount := numberOfNodes + delta
+		client.On("UpdateNodePool",
+			ctx,
+			ng.clusterID,
+			ng.id,
+			&godo.KubernetesNodePoolUpdateRequest{
+				Count: &newCount,
+			},
+		).Return(
+			&godo.KubernetesNodePool{Count: newCount},
 			&godo.Response{},
 			nil,
 		).Once()
@@ -130,15 +164,44 @@ func TestNodeGroup_DecreaseTargetSize(t *testing.T) {
 
 		delta := -2
 
+		newCount := numberOfNodes + delta
 		client.On("UpdateNodePool",
 			ctx,
 			ng.clusterID,
 			ng.id,
 			&godo.KubernetesNodePoolUpdateRequest{
-				Count: numberOfNodes + delta,
+				Count: &newCount,
 			},
 		).Return(
-			&godo.KubernetesNodePool{Count: numberOfNodes + delta},
+			&godo.KubernetesNodePool{Count: newCount},
+			&godo.Response{},
+			nil,
+		).Once()
+
+		err := ng.DecreaseTargetSize(delta)
+		assert.NoError(t, err)
+	})
+
+	t.Run("successful decrease to minimum", func(t *testing.T) {
+		client := &doClientMock{}
+		ng := testNodeGroup(client, &godo.KubernetesNodePool{
+			Count:     2,
+			AutoScale: true,
+			MinNodes:  1,
+			MaxNodes:  5,
+		})
+
+		delta := -1
+		newCount := ng.nodePool.Count + delta
+		client.On("UpdateNodePool",
+			ctx,
+			ng.clusterID,
+			ng.id,
+			&godo.KubernetesNodePoolUpdateRequest{
+				Count: &newCount,
+			},
+		).Return(
+			&godo.KubernetesNodePool{Count: newCount},
 			&godo.Response{},
 			nil,
 		).Once()
@@ -180,7 +243,9 @@ func TestNodeGroup_DecreaseTargetSize(t *testing.T) {
 		numberOfNodes := 3
 		client := &doClientMock{}
 		ng := testNodeGroup(client, &godo.KubernetesNodePool{
-			Count: numberOfNodes,
+			Count:    numberOfNodes,
+			MinNodes: 2,
+			MaxNodes: 5,
 		})
 
 		exp := fmt.Errorf("size decrease is too small. current: %d desired: %d min: %d",
@@ -247,18 +312,21 @@ func TestNodeGroup_Nodes(t *testing.T) {
 					Status: &godo.KubernetesNodeStatus{
 						State: "provisioning",
 					},
+					DropletID: "droplet-1",
 				},
 				{
 					ID: "2",
 					Status: &godo.KubernetesNodeStatus{
 						State: "running",
 					},
+					DropletID: "droplet-2",
 				},
 				{
 					ID: "3",
 					Status: &godo.KubernetesNodeStatus{
 						State: "deleting",
 					},
+					DropletID: "droplet-3",
 				},
 				{
 					ID: "4",
@@ -266,10 +334,12 @@ func TestNodeGroup_Nodes(t *testing.T) {
 						State:   "unknown",
 						Message: "some-message",
 					},
+					DropletID: "droplet-4",
 				},
 				{
 					// no status
-					ID: "5",
+					ID:        "5",
+					DropletID: "droplet-5",
 				},
 			},
 			Count: 5,
@@ -277,25 +347,25 @@ func TestNodeGroup_Nodes(t *testing.T) {
 
 		exp := []cloudprovider.Instance{
 			{
-				Id: "1",
+				Id: "digitalocean://droplet-1",
 				Status: &cloudprovider.InstanceStatus{
 					State: cloudprovider.InstanceCreating,
 				},
 			},
 			{
-				Id: "2",
+				Id: "digitalocean://droplet-2",
 				Status: &cloudprovider.InstanceStatus{
 					State: cloudprovider.InstanceRunning,
 				},
 			},
 			{
-				Id: "3",
+				Id: "digitalocean://droplet-3",
 				Status: &cloudprovider.InstanceStatus{
 					State: cloudprovider.InstanceDeleting,
 				},
 			},
 			{
-				Id: "4",
+				Id: "digitalocean://droplet-4",
 				Status: &cloudprovider.InstanceStatus{
 					ErrorInfo: &cloudprovider.InstanceErrorInfo{
 						ErrorClass:   cloudprovider.OtherErrorClass,
@@ -305,7 +375,7 @@ func TestNodeGroup_Nodes(t *testing.T) {
 				},
 			},
 			{
-				Id: "5",
+				Id: "digitalocean://droplet-5",
 			},
 		}
 
@@ -326,7 +396,11 @@ func TestNodeGroup_Nodes(t *testing.T) {
 func TestNodeGroup_Debug(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		client := &doClientMock{}
-		ng := testNodeGroup(client, &godo.KubernetesNodePool{Count: 3})
+		ng := testNodeGroup(client, &godo.KubernetesNodePool{
+			Count:    3,
+			MinNodes: 1,
+			MaxNodes: 200,
+		})
 
 		d := ng.Debug()
 		exp := "cluster ID: 1 (min:1 max:200)"
@@ -353,13 +427,18 @@ func TestNodeGroup_Exist(t *testing.T) {
 }
 
 func testNodeGroup(client nodeGroupClient, np *godo.KubernetesNodePool) *NodeGroup {
+	var minNodes, maxNodes int
+	if np != nil {
+		minNodes = np.MinNodes
+		maxNodes = np.MaxNodes
+	}
 	return &NodeGroup{
 		id:        "1",
 		clusterID: "1",
 		client:    client,
 		nodePool:  np,
-		minSize:   minNodePoolSize,
-		maxSize:   maxNodePoolSize,
+		minSize:   minNodes,
+		maxSize:   maxNodes,
 	}
 }
 

@@ -20,7 +20,7 @@ import (
 	"reflect"
 
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/klog"
+	klog "k8s.io/klog/v2"
 
 	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/utils"
@@ -71,17 +71,8 @@ func (n *PreFilteringScaleDownNodeProcessor) GetScaleDownCandidates(ctx *context
 	return result, nil
 }
 
-// GetTemporaryNodes returns nodes that are temporary and will not stay in the node group
-func (n *PreFilteringScaleDownNodeProcessor) GetTemporaryNodes(allNodes []*apiv1.Node) ([]*apiv1.Node, errors.AutoscalerError) {
-	return nil, nil
-}
-
 // CleanUp is called at CA termination.
 func (n *PreFilteringScaleDownNodeProcessor) CleanUp() {
-}
-
-// Reset is called before the other funcs of the processors are called every CA loop.
-func (n *PreFilteringScaleDownNodeProcessor) Reset() {
 }
 
 // NewPreFilteringScaleDownNodeProcessor returns a new PreFilteringScaleDownNodeProcessor.
