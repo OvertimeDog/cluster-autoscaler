@@ -1143,6 +1143,14 @@ func fakeNode(instance cloudprovider.Instance, reason string) *apiv1.Node {
 		Spec: apiv1.NodeSpec{
 			ProviderID: instance.Id,
 		},
+		Status: apiv1.NodeStatus{
+			Addresses: []apiv1.NodeAddress{
+				{
+					Type:    apiv1.NodeInternalIP,
+					Address: instance.Id,
+				},
+			},
+		},
 	}
 }
 
