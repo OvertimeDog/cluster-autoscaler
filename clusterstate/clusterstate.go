@@ -893,20 +893,19 @@ func hasTaint(node *apiv1.Node, taintKey string) bool {
 }
 
 func isNodeStillStarting(node *apiv1.Node, maxNodeStartScheduleTime time.Duration) bool {
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == apiv1.NodeReady {
-			// fix(bcs): node would become ready but is tainted as unschedulable in a short time
-			notReady := condition.Status != apiv1.ConditionTrue || hasTaint(node, "node.kubernetes.io/unschedulable")
-			if notReady && condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < maxNodeStartScheduleTime {
-				return true
-			}
-		}
+	// fix(bcs): node would become ready but is tainted as unschedulable in a short time
+	if hasTaint(node, "node.kubernetes.io/unschedulable") &&
+		time.Now().Sub(node.CreationTimestamp.Time) < maxNodeStartScheduleTime {
+		return true
+	}
 
-		// if condition.Type == apiv1.NodeReady &&
-		// 	condition.Status != apiv1.ConditionTrue &&
-		// 	condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
-		// 	return true
-		// }
+	for _, condition := range node.Status.Conditions {
+
+		if condition.Type == apiv1.NodeReady &&
+			condition.Status != apiv1.ConditionTrue &&
+			condition.LastTransitionTime.Time.Sub(node.CreationTimestamp.Time) < MaxStatusSettingDelayAfterCreation {
+			return true
+		}
 
 		if condition.Type == apiv1.NodeDiskPressure &&
 			condition.Status == apiv1.ConditionTrue &&
