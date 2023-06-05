@@ -348,6 +348,8 @@ replace (
 	sigs.k8s.io/structured-merge-diff => sigs.k8s.io/structured-merge-diff v0.0.0-20190817042607-6149e4549fca
 	sigs.k8s.io/yaml => sigs.k8s.io/yaml v1.1.0
 	vbom.ml/util => vbom.ml/util v0.0.0-20160121211510-db5cfe13f5cc
+	github.com/satori/go.uuid v1.2.0 => github.com/gofrs/uuid v4.4.0+incompatible
+	github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt/jwt/v4 v4.1.0
 )
 
 replace github.com/rancher/go-rancher => github.com/rancher/go-rancher v0.1.0
