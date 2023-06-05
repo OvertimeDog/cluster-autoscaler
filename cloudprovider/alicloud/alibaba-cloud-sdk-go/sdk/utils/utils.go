@@ -37,7 +37,7 @@ var (
 
 // GetUUIDV4 returns uuidHex
 func GetUUIDV4() (uuidHex string) {
-	uuidV4 := uuid.NewV4()
+	uuidV4, _ := uuid.NewV4()
 	uuidHex = hex.EncodeToString(uuidV4.Bytes())
 	return
 }

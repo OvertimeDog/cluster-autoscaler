@@ -97,3 +97,5 @@ replace k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.22.0
 replace k8s.io/sample-controller => k8s.io/sample-controller v0.22.0
 
 replace k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.22.0
+
+replace github.com/satori/go.uuid v1.2.0 => github.com/gofrs/uuid v4.4.0+incompatible
