@@ -898,6 +898,11 @@ func isNodeStillStarting(node *apiv1.Node, maxNodeStartScheduleTime time.Duratio
 		time.Now().Sub(node.CreationTimestamp.Time) < maxNodeStartScheduleTime {
 		return true
 	}
+	// fix(bcs): node with specific taint in a short time should be considered as still starting
+	if hasTaint(node, "bcs-cluster-manager") &&
+		time.Now().Sub(node.CreationTimestamp.Time) < maxNodeStartScheduleTime {
+		return true
+	}
 
 	for _, condition := range node.Status.Conditions {
 
