@@ -49,7 +49,7 @@ func CreateEventRecorder(kubeClient clientset.Interface) kube_record.EventRecord
 		sinkWithLogging := WrapEventSinkWithLogging(actualSink)
 		eventBroadcaster.StartRecordingToSink(sinkWithLogging)
 	}
-	return eventBroadcaster.NewRecorder(scheme.Scheme, clientv1.EventSource{Component: "cluster-autoscaler"})
+	return eventBroadcaster.NewRecorder(scheme.Scheme, clientv1.EventSource{Component: "bcs-cluster-autoscaler"})
 }
 
 func getCorrelationOptions() kube_record.CorrelatorOptions {
