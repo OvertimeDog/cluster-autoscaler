@@ -45,7 +45,7 @@ func CreateEventRecorder(kubeClient clientset.Interface) kube_record.EventRecord
 	if _, isfake := kubeClient.(*fake.Clientset); !isfake {
 		eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.CoreV1().RESTClient()).Events("")})
 	}
-	return eventBroadcaster.NewRecorder(scheme.Scheme, clientv1.EventSource{Component: "cluster-autoscaler"})
+	return eventBroadcaster.NewRecorder(scheme.Scheme, clientv1.EventSource{Component: "bcs-cluster-autoscaler"})
 }
 
 func getCorrelationOptions() kube_record.CorrelatorOptions {
